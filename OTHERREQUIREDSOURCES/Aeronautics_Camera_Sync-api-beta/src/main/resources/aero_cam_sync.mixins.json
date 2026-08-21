@@ -1,0 +1,35 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.playsi.aero_cam_sync.mixins",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EntityLookMixin",
+    "ProjectileShootTiltMixin",
+    "ItemPovTiltMixin",
+    "PlayerDropTiltMixin",
+    "CreateRaycastTiltMixin",
+    "ClipNetMixin",
+    "compat.SimulatedStaffGoalMixin"
+  ],
+  "client": [
+    "client.CameraMixin",
+    "client.EntityRenderEyeMixin",
+    "client.FirstPersonModelTiltMixin",
+    "client.PickScopeMixin",
+    "client.SableEyeMixin",
+    "compat.CreateBigOutlinesEyeMixin",
+    "compat.CreateSuperGlueEyeMixin",
+    "compat.SimulatedHoneyGlueEyeMixin",
+    "compat.SimulatedStaffBeamMixin",
+    "compat.SimulatedStaffFocusMixin",
+    "legacy.GameRendererPickMixin",
+    "legacy.SableCompatClipMixin"
+  ],
+  "mixinextras": {
+    "minVersion": "0.5.0"
+  },
+  "injectors": {
+    "defaultRequireValue": 1
+  }
+}

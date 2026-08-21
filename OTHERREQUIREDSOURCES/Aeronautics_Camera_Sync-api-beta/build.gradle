@@ -1,0 +1,197 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+    id 'net.neoforged.gradle.userdev' version '7.1.25'
+}
+
+tasks.named('wrapper', Wrapper).configure {
+    distributionType = Wrapper.DistributionType.BIN
+}
+
+version = mod_version
+group = mod_group_id
+
+sourceSets.main.resources {
+    srcDir('src/generated/resources')
+
+    exclude("**/*.bbmodel")
+    exclude("src/generated/**/.cache")
+}
+
+repositories {
+    // JUnit для юнит-тестов (SuppressionLeasesTest). Больше отсюда ничего не берётся —
+    // все игровые зависимости лежат в мавенах ниже.
+    mavenCentral()
+    maven { url = "https://maven.createmod.net" }
+    maven { url = "https://api.modrinth.com/maven"}
+    maven { url = "https://maven.ryanhcode.dev/releases"}
+    // MixinSquared — единственный способ дотянуться до обработчиков чужих миксинов
+    // (compat/CutThroughDistanceMixin, см. ACS-PITFALLS.md §1.5).
+    maven { url = "https://maven.bawnorton.com/releases" }
+}
+
+base {
+    archivesName = mod_id
+}
+
+// С момента подключения MixinSquared (compat с Cut Through) релизный артефакт — тот, что
+// собирает jarJar: только в нём лежит META-INF/jarjar с библиотекой. Меняем классификаторы
+// местами, чтобы «главным» файлом в build/libs остался привычный aero_cam_sync-<версия>.jar,
+// а не -all.jar — иначе на релизе легко выложить jar без библиотеки, и мод упадёт у игроков.
+tasks.named('jar') { archiveClassifier = 'slim' }
+tasks.named('jarJar') { archiveClassifier = '' }
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+// Юнит-тесты покрывают ровно один класс — аренды подавления (apiimpl/SuppressionLeases).
+// Он единственный в моде, где есть чистая логика без Minecraft, и одновременно самый
+// ошибкоопасный кусок API: истечение, продление, чужой release, остановка часов на паузе.
+// Всё остальное проверяется живьём, по чек-листу релиза.
+tasks.named('test', Test) {
+    useJUnitPlatform()
+}
+
+runs {
+    configureEach {
+        systemProperty 'forge.logging.markers', 'REGISTRIES'
+        systemProperty 'forge.logging.console.level', 'debug'
+
+        modSource project.sourceSets.main
+    }
+
+    // Два клиента + сервер: проверять наклон/пик приходится в мультиплеере (сервер с модом),
+    // а половину багов видно только со стороны второго игрока. Имена заданы явно: ванильный
+    // дев-ран не передаёт --username вообще, поэтому оба клиента иначе получили бы одно и то
+    // же имя и второй не смог бы зайти. Оба имени прописаны в runs/server/ops.json.
+    client {
+        systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        arguments.addAll '--username', 'Dev'
+        jvmArguments.addAll '-Xmx6G'
+    }
+
+    client2 {
+        configure('client')
+        systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        arguments.addAll '--username', 'Dev2'
+        jvmArguments.addAll '-Xmx6G'
+    }
+
+    server {
+        systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        argument '--nogui'
+    }
+
+    gameTestServer {
+        systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+    }
+
+    data {
+        arguments.addAll '--mod', project.mod_id, '--all', '--output', file('src/generated/resources/').getAbsolutePath(), '--existing', file('src/main/resources/').getAbsolutePath()
+    }
+}
+
+minecraft {
+    accessTransformers {
+        file 'src/main/resources/META-INF/accesstransformer.cfg'
+    }
+}
+
+configurations {
+    runtimeClasspath.extendsFrom localRuntime
+}
+
+dependencies {
+    implementation "net.neoforged:neoforge:${neo_version}"
+
+    testImplementation platform("org.junit:junit-bom:${junit_version}")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+
+    //create
+    implementation("com.simibubi.create:create-${minecraft_version}:${create_version}") { transitive = false }
+
+    //ponder
+    implementation("net.createmod.ponder:ponder-neoforge:${ponder_version}+mc${minecraft_version}")
+
+    //flywheel
+    compileOnly "dev.engine-room.flywheel:flywheel-neoforge-api-${minecraft_version}:${flywheel_version}"
+    runtimeOnly "dev.engine-room.flywheel:flywheel-neoforge-${minecraft_version}:${flywheel_version}"
+
+    // Create Aeronautics
+    compileOnly "maven.modrinth:create-aeronautics:${aeronautics_version}"
+    runtimeOnly "maven.modrinth:create-aeronautics:${aeronautics_version}"
+
+    // Внутренние либы Create Aeronautics (в рантайме бандлятся через JarInJar внутри create-aeronautics).
+    // transitive = false: тянем только сами jar-ы (как раньше libs/*.jar), без их POM-зависимостей
+    compileOnly("dev.eriksonn.aeronautics:aeronautics-neoforge-${minecraft_version}:${aeronautics_bundle_version}") { transitive = false }
+    compileOnly("dev.ryanhcode.offroad:offroad-neoforge-${minecraft_version}:${aeronautics_bundle_version}") { transitive = false }
+    compileOnly("dev.simulated_team.simulated:simulated-neoforge-${minecraft_version}:${aeronautics_bundle_version}") { transitive = false }
+
+    compileOnly("dev.ryanhcode.sable-companion:sable-companion-common-${minecraft_version}:${sable_companion_version}")
+
+    // MixinSquared: селектор @TargetHandler, чтобы инжектиться в обработчики чужих миксинов.
+    // Нужен ровно одному файлу — compat/CutThroughDistanceMixin. Обычным Mixin'ом туда не
+    // попасть: обработчики с сахаром MixinExtras появляются в целевом классе позже, чем
+    // инжекторы ищут цели (ACS-PITFALLS.md §1.5). Едет внутри нашего jar через JarInJar,
+    // диапазон версий — чтобы не конфликтовать с модами, которые везут её же.
+    compileOnly(annotationProcessor("com.github.bawnorton.mixinsquared:mixinsquared-common:${mixin_squared_version}"))
+    implementation(jarJar("com.github.bawnorton.mixinsquared:mixinsquared-neoforge:${mixin_squared_version}")) {
+        jarJar.ranged(it, "[${mixin_squared_version},)")
+    }
+
+    api("dev.ryanhcode.sable:sable-neoforge-${minecraft_version}:$sable_version") {
+        exclude group: "foundry.veil"
+        exclude group: "com.tterrag.registrate"
+    }
+
+    // --- ВРЕМЕННО: регресс-набор в dev-ране (ветка fix/pick-and-clip-architecture) ------
+    // Держим моды, которые ловят наши классы конфликтов, прямо в ране — чтобы регресс был
+    // виден сразу, а не у пользователя. Каждый здесь не «на всякий случай», а по делу:
+    //   cut-through   — правит GameRenderer#pick изнутри (MixinExtras). Проверяет, что мы
+    //                   больше не стираем чужой результат пика.
+    //   puzzles-lib   — обязательная зависимость cut-through.
+    //   sound-physics — трассирует звук из ФОНОВЫХ потоков через world.clip(). Проверяет,
+    //                   что новые хуки не лезут в чужой поток (§5 подводных камней).
+    //   first-person  — свой рендер тела от первого лица, зависит от нашей камеры.
+    //   point-blank   — оружие со своими лучами (+ geckolib, его обязательная зависимость).
+    // Create Simulated (throttle lever, диаграмма) отдельно тянуть не нужно — он приезжает
+    // внутри create-aeronautics через JarInJar.
+    //
+    // Bits'n'Tracks здесь НЕТ намеренно: рабочая связка — только 1.0.3.1-release со своими
+    // библиотеками (bits_n_bobs, struts, azimuth), другие версии не стартуют. Держим её
+    // ручными jar-ами в runs/*/mods, а не зависимостью, чтобы Gradle не подтянул «свежее».
+    // УБРАТЬ вместе с версиями в gradle.properties, когда старый путь пика удалён.
+    runtimeOnly "maven.modrinth:cut-through:${cut_through_version}"
+    runtimeOnly "maven.modrinth:puzzles-lib:${puzzles_lib_version}"
+    runtimeOnly "maven.modrinth:sound-physics-remastered:${sound_physics_version}"
+    runtimeOnly "maven.modrinth:${first_person_model_id}:${first_person_model_version}"
+    runtimeOnly "maven.modrinth:${point_blank_id}:${point_blank_version}"
+    runtimeOnly "maven.modrinth:${geckolib_id}:${geckolib_version}"
+    // -----------------------------------------------------------------------------------
+
+
+
+    tasks.withType(ProcessResources).configureEach {
+        var replaceProperties = [
+                minecraft_version      : minecraft_version,
+                minecraft_version_range: minecraft_version_range,
+                neo_version            : neo_version,
+                loader_version_range   : loader_version_range,
+                mod_id                 : mod_id,
+                mod_name               : mod_name,
+                mod_license            : mod_license,
+                mod_version            : mod_version,
+        ]
+        inputs.properties replaceProperties
+
+        filesMatching(['META-INF/neoforge.mods.toml']) {
+            expand replaceProperties
+        }
+    }
+
+    idea {
+        module {
+            downloadSources = true
+            downloadJavadoc = true
+        }
+    }
+}

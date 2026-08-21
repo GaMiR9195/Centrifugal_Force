@@ -1,0 +1,34 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+issueTrackerURL = "https://github.com/minerguy341/sable-surefooting/issues"
+
+[[mods]]
+modId = "surefooting"
+version = "${mod_version}"
+displayName = "Sable: Sure Footing"
+logoFile = "logo.png"
+logoBlur = false
+description = '''Keeps you moving with a Sable contraption (Create: Aeronautics) while you jump, so you land where you took off — including on rotating platforms.'''
+authors = "minerguy341"
+
+[[dependencies.surefooting]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1.0,21.2)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.surefooting]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1]"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.surefooting]]
+modId = "sable"
+type = "required"
+versionRange = "${sable_version_range}"
+ordering = "AFTER"
+side = "BOTH"

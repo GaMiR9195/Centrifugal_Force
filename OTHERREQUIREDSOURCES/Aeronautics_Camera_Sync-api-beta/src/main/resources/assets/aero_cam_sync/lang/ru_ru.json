@@ -1,0 +1,151 @@
+{
+  "aero_cam_sync.configuration.title": "Настройки Aeronautics Camera Sync",
+
+  "aero_cam_sync.configuration.mode.clientOnly": "режим: client-only",
+  "aero_cam_sync.configuration.mode.clientOnly.tooltip": "Сервер не подключён",
+  "aero_cam_sync.configuration.mode.clientServer": "режим: server-client",
+  "aero_cam_sync.configuration.mode.clientServer.tooltip": "Сервер подключён",
+  "aero_cam_sync.configuration.mode.pending.suffix": " *",
+  "aero_cam_sync.configuration.mode.pending.tooltip": "«Только на клиенте» изменено? применится после перезахода в мир",
+
+  "aero_cam_sync.configuration.general": "Основное",
+  "aero_cam_sync.configuration.enabled": "Включить мод",
+  "aero_cam_sync.configuration.enabled.tooltip": "Включает или отключает мод",
+  "aero_cam_sync.configuration.ignoreServer": "Только на клиенте",
+  "aero_cam_sync.configuration.ignoreServer.tooltip": "Принудительно использовать только клиентскую часть мода. ПРИМЕНЯЕТЬСЯ после перезахода в мир",
+  "aero_cam_sync.configuration.minNormalY": "Макс. угол наклона",
+  "aero_cam_sync.configuration.minNormalY.tooltip": "Максимальный угол наклона камеры (0.0 = любой, 1.0 = только ровно)",
+  "aero_cam_sync.configuration.general.misc": "Прочее",
+
+  "aero_cam_sync.configuration.camera": "Камера",
+  "aero_cam_sync.configuration.camera.tilt": "Наклон",
+  "aero_cam_sync.configuration.rotateCamera": "Поворот камеры",
+  "aero_cam_sync.configuration.rotateCamera.tooltip": "Наклоняет камеру в зависимости от поверхности",
+  "aero_cam_sync.configuration.moveCamera": "Смещение камеры",
+  "aero_cam_sync.configuration.moveCamera.tooltip": "Смещает камеру вместе с наклоном",
+  "aero_cam_sync.configuration.smoothSpeed": "Скорость сглаживания",
+  "aero_cam_sync.configuration.smoothSpeed.tooltip": "Скорость интерполяции. 0.0 = мгновенно, 9999 = почти никогда",
+
+  "aero_cam_sync.configuration.camera.collision": "Столкновения камеры",
+  "aero_cam_sync.configuration.cameraCollision": "Столкновения камеры",
+  "aero_cam_sync.configuration.cameraCollision.tooltip": "Предотвращает проход камеры в блоки",
+  "aero_cam_sync.configuration.cameraCollisionSmooth": "Плавность у стены",
+  "aero_cam_sync.configuration.cameraCollisionSmooth.tooltip": "Насколько плавно наклон ослабевает при подходе камеры к стене, в тиках (0 = мгновенно, больше = плавнее)",
+
+  "aero_cam_sync.configuration.camera.serverOnly": "Требует мод на сервере",
+  "aero_cam_sync.configuration.dropFromCamera": "Выброс предметов от камеры",
+  "aero_cam_sync.configuration.dropFromCamera.tooltip": "Исправляет траекторию выброшенного игроком предмета. Требует установки мода на сервере.",
+  "aero_cam_sync.configuration.dropCacheOnAllMiss": "Сбрасывать подуровень мгновенно",
+  "aero_cam_sync.configuration.dropCacheOnAllMiss.tooltip": "Предотвращает повторный наклон камеры при нахождении игрока над подуровнем",
+  "aero_cam_sync.configuration.disableOnFlying": "Отключать при полёте",
+  "aero_cam_sync.configuration.disableOnFlying.tooltip": "Отключает наклон при полёте (креатив, наблюдатель)",
+
+  "aero_cam_sync.configuration.activation": "Активация",
+  "aero_cam_sync.configuration.activation.physical": "Масса и блоки",
+  "aero_cam_sync.configuration.activation.size": "Габариты",
+  "aero_cam_sync.configuration.gateMass": "Масса",
+  "aero_cam_sync.configuration.gateMass.tooltip": "Наклонять только если масса сабвела ≥ значения (основной критерий)",
+  "aero_cam_sync.configuration.gateBlocks": "Число блоков",
+  "aero_cam_sync.configuration.gateBlocks.tooltip": "Наклонять только если число блоков сабвела ≥ значения",
+  "aero_cam_sync.configuration.gateLength": "Длина (X)",
+  "aero_cam_sync.configuration.gateLength.tooltip": "Наклонять только если длина сабвела (X, блоки) ≥ значения",
+  "aero_cam_sync.configuration.gateHeight": "Высота (Y)",
+  "aero_cam_sync.configuration.gateHeight.tooltip": "Наклонять только если высота сабвела (Y, блоки) ≥ значения",
+  "aero_cam_sync.configuration.gateWidth": "Ширина (Z)",
+  "aero_cam_sync.configuration.gateWidth.tooltip": "Наклонять только если ширина сабвела (Z, блоки) ≥ значения",
+  "aero_cam_sync.configuration.activation.misc": "Прочее",
+
+  "aero_cam_sync.configuration.clientBlacklist": "Чёрный список предметов",
+  "aero_cam_sync.configuration.clientBlacklist.enabled": "Отключать наклон для предметов из списка",
+  "aero_cam_sync.configuration.clientBlacklist.enabled.tooltip": "Отключает наклон камеры при удержании предмета из списка (мод установлен только на клиенте)",
+
+  "aero_cam_sync.configuration.considerOffhand": "Учитывать вторую руку",
+  "aero_cam_sync.configuration.considerOffhand.tooltip": "Применять чёрный список ко второй руке",
+  "aero_cam_sync.configuration.autoDisableForRaycastItems": "Авто-отключение для снарядов/вёдер",
+  "aero_cam_sync.configuration.autoDisableForRaycastItems.tooltip": "Только для режима client-only: полностью отключает наклон камеры, пока в руке предмет-снаряд или ведро (определяются по классу, включая модовые), чтобы бросок/установка шли верно. Не нужен, если мод стоит на сервере — сервер сам поправит направление.",
+
+  "aero_cam_sync.configuration.addMainhandItemKey": "Клавиша добавления в список",
+  "aero_cam_sync.configuration.addMainhandItemKey.tooltip": "Добавлять/удалять предмет в руке в чёрный список",
+
+  "aero_cam_sync.configuration.clientBlacklist.separator": "Чёрный список (клиент)",
+
+  "aero_cam_sync.configuration.serverBlacklist": "Чёрный список сервера",
+  "aero_cam_sync.configuration.serverBlacklist.enabled": "Включить чёрный список сервера",
+  "aero_cam_sync.configuration.serverBlacklist.enabled.tooltip": "Отключает наклон камеры при удержании предмета из списка (мод установлен на сервере)",
+
+  "aero_cam_sync.configuration.list.add": "+ Добавить",
+  "aero_cam_sync.configuration.list.remove": "Удалить",
+  "aero_cam_sync.configuration.list.placeholder": "minecraft:item_id",
+  "aero_cam_sync.configuration.list.empty": "",
+
+  "aero_cam_sync.configuration.list.tooltip.ok": "ID: %s",
+  "aero_cam_sync.configuration.list.tooltip.not_found": "Не найдено: %s",
+  "aero_cam_sync.configuration.list.tooltip.empty": "Предмет не указан",
+  "aero_cam_sync.configuration.list.tooltip.error": "Ошибка отображения:",
+
+  "msg.aero_cam_sync.no_item_in_hand": "В основной руке нет предмета",
+  "msg.aero_cam_sync.added_to_blacklist": "Предмет %s добавлен в чёрный список",
+  "msg.aero_cam_sync.removed_from_blacklist": "Предмет %s удалён из чёрного списка",
+
+  "aero_cam_sync.configuration.raycast": "Рейкасты",
+  "aero_cam_sync.configuration.count": "Количество лучей",
+  "aero_cam_sync.configuration.count.tooltip": "Число лучей для определения поверхности (стабильное количество 10)",
+  "aero_cam_sync.configuration.downLength": "Дистанция до поверхности",
+  "aero_cam_sync.configuration.downLength.tooltip": "Максимальное расстояние вниз для поиска поверхности",
+  "aero_cam_sync.configuration.upLength": "Смещение от ног",
+  "aero_cam_sync.configuration.upLength.tooltip": "Вертикальное смещение точки начала лучей от ног",
+
+  "aero_cam_sync.configuration.debug": "Отладка",
+  "aero_cam_sync.configuration.rays": "Показать лучи",
+  "aero_cam_sync.configuration.rays.tooltip": "Отображать лучи выборки в мире",
+  "aero_cam_sync.configuration.pickRays": "Показать луч выбора",
+  "aero_cam_sync.configuration.pickRays.tooltip": "Наклонённый луч выбора",
+  "aero_cam_sync.configuration.pickRaysTimeSec": "Время показа лучей выбора",
+  "aero_cam_sync.configuration.pickRaysTimeSec.tooltip": "Сколько времени лучи выбора будут видны",
+  "aero_cam_sync.configuration.debugMessages": "Сообщения в консоли",
+  "aero_cam_sync.configuration.debugMessages.tooltip": "Вывод отладочной информации в консоль",
+  "aero_cam_sync.configuration.legacyPick": "Старый пик (откат)",
+  "aero_cam_sync.configuration.legacyPick.tooltip": "Только для диагностики. Возвращает старый пик: он перезаписывает результаты чужих модов и сдвигает посторонние лучи рядом с игроком",
+
+  "aero_cam_sync.configuration.toggle.on": "Вкл",
+  "aero_cam_sync.configuration.toggle.off": "Выкл",
+
+  "aero_cam_sync.configuration.toggleKey": "Клавиша включения",
+  "aero_cam_sync.configuration.toggleKey.tooltip": "Назначить клавишу",
+  "aero_cam_sync.configuration.openConfigKey": "Открыть настройки",
+  "aero_cam_sync.configuration.openConfigKey.tooltip": "Назначить клавишу",
+
+  "aero_cam_sync.configuration.keybind.conflict": "Клавиша уже используется, возможны конфликты!",
+
+  "key.aero_cam_sync.none": "Не назначена",
+
+  "aero_cam_sync.configuration.btn.cancel": "Отмена",
+  "aero_cam_sync.configuration.btn.reset": "Сброс",
+  "aero_cam_sync.configuration.btn.reset.tooltip": "Сбросить текущую категорию. Удерживайте Shift для разблокировки",
+  "aero_cam_sync.configuration.btn.save": "Сохранить",
+
+  "aero_cam_sync.configuration.hardLimitWarning": "Один или несколько параметров заданы некоректно!",
+
+  "key.aero_cam_sync.toggle": "Переключить наклон камеры",
+  "key.category.aero_cam_sync": "Aeronautics Camera Sync",
+  "msg.aero_cam_sync.enabled": "§aНаклон камеры: ВКЛ",
+  "msg.aero_cam_sync.disabled": "§cНаклон камеры: ВЫКЛ",
+  "msg.aero_cam_sync.suppressed_by": "§e* Наклон камеры выключен модом %s",
+
+  "key.aero_cam_sync.open_config": "Открыть настройки мода",
+
+  "key.aero_cam_sync.devtest.suppress": "[dev] API: подавить наклон на 3 с",
+  "key.aero_cam_sync.devtest.snapshot": "[dev] API: снимок состояния в чат",
+  "key.aero_cam_sync.devtest.vanilla_eye": "[dev] API: сравнить область withVanillaEye",
+  "key.aero_cam_sync.devtest.policy": "[dev] API: сменить режим политики прицела",
+  "key.aero_cam_sync.devtest.probe": "[dev] API: пустить пробные лучи политики",
+  "key.aero_cam_sync.devtest.collision": "[dev] API: переключить коллизию камеры",
+  "key.aero_cam_sync.devtest.third_person": "[dev] API: переключить третье лицо",
+
+
+  "screen.aero_cam_sync.config_reset.title": "Aeronautics Camera Sync — сброс конфигурации",
+  "screen.aero_cam_sync.config_reset.body1": "Файл конфигурации устарел и может вызывать ошибки.",
+  "screen.aero_cam_sync.config_reset.body2": "Сбросить настройки по умолчанию?",
+  "screen.aero_cam_sync.config_reset.yes": "Сбросить",
+  "screen.aero_cam_sync.config_reset.no": "Игнорировать"
+}
