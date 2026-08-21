@@ -1,0 +1,79 @@
+plugins {
+    id 'java'
+    id 'net.neoforged.moddev' version '2.0.141'
+}
+
+version = mod_version
+group = 'dev.gamir.sable_cf'
+base.archivesName = 'sable-centrifugal-force'
+
+// Java 21 is what 1.21.1 / NeoForge 21.1 runs on, and what Sable, ACS and Sure Footing are all
+// built with. Nothing here needs a newer language level.
+java.toolchain.languageVersion = JavaLanguageVersion.of(21)
+
+repositories {
+    mavenCentral()
+    maven {
+        name = 'RyanHCode'
+        url = 'https://maven.ryanhcode.dev/releases'
+    }
+    maven {
+        name = 'Modrinth'
+        url = 'https://api.modrinth.com/maven'
+        content { includeGroup 'maven.modrinth' }
+    }
+}
+
+neoForge {
+    version = neoforge_version
+
+    runs {
+        client {
+            client()
+        }
+        server {
+            server()
+        }
+    }
+
+    mods {
+        sable_cf {
+            sourceSet sourceSets.main
+        }
+    }
+}
+
+// AcsHandle#addTiltSource() lives on the api-beta line of ACS, which is newer than the published
+// 1.3.7 on Modrinth. Put that jar in libs/ and it wins; with an empty libs/ we fall back to 1.3.7,
+// everything except client/CfTiltSource.java still compiles, and the mod runs with the camera off.
+def acsLocalJar = fileTree(dir: 'libs', include: ['aero_cam_sync*.jar'])
+
+dependencies {
+    compileOnly("dev.ryanhcode.sable:sable-neoforge-1.21.1:${sable_version}") { transitive = false }
+    compileOnly("dev.ryanhcode.sable-companion:sable-companion-common-1.21.1:${sable_companion_version}") { transitive = false }
+
+    if (!acsLocalJar.isEmpty()) {
+        logger.lifecycle("sable_cf: compiling the camera against the local ACS jar(s): ${acsLocalJar.files*.name}")
+        compileOnly acsLocalJar
+    } else {
+        logger.lifecycle("sable_cf: libs/ has no ACS jar - falling back to maven.modrinth:aero_cam_sync:${acs_version}. addTiltSource() will NOT resolve; see README.")
+        compileOnly("maven.modrinth:aero_cam_sync:${acs_version}") { transitive = false }
+    }
+}
+
+processResources {
+    var replaceProperties = [
+            mod_version              : mod_version,
+            sable_version_range      : sable_version_range,
+            acs_version_range        : acs_version_range,
+            surefooting_version_range: surefooting_version_range,
+    ]
+    inputs.properties replaceProperties
+    filesMatching('META-INF/neoforge.mods.toml') {
+        expand replaceProperties
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

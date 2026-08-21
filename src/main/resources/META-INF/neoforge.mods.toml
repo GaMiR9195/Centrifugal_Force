@@ -1,0 +1,53 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+issueTrackerURL = "https://github.com/GaMiR9195/Centrifugal_Force/issues"
+
+[[mods]]
+modId = "sable_cf"
+version = "${mod_version}"
+displayName = "Sable: Centrifugal Force"
+logoBlur = false
+description = '''Rotating-frame physics for Sable sub-levels: centrifugal, Euler and Coriolis acceleration on the player, air drag fighting static friction so you slide or get swept off, and a camera that tilts towards felt gravity instead of towards the deck plane.'''
+authors = "GaMiR9195"
+
+[[dependencies.sable_cf]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1.0,21.2)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.sable_cf]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1]"
+ordering = "NONE"
+side = "BOTH"
+
+# Hard requirement: without sub-levels there is no rotating frame to be in.
+# Pinned to 2.0.x because compat/SableAccess touches @ApiStatus.Internal duck interfaces.
+[[dependencies.sable_cf]]
+modId = "sable"
+type = "required"
+versionRange = "${sable_version_range}"
+ordering = "AFTER"
+side = "BOTH"
+
+# Soft: only the camera needs it. Without ACS the physics and the debug overlay still run.
+# ordering = AFTER so its handle registry exists by the time our constructor asks for a handle.
+[[dependencies.sable_cf]]
+modId = "aero_cam_sync"
+type = "optional"
+versionRange = "${acs_version_range}"
+ordering = "AFTER"
+side = "CLIENT"
+
+# Soft: we never call into it. It keeps the player in the sub-level's frame through a jump arc,
+# which is exactly the inherited-inertia half of the job, so we deliberately do not duplicate it.
+[[dependencies.sable_cf]]
+modId = "surefooting"
+type = "optional"
+versionRange = "${surefooting_version_range}"
+ordering = "AFTER"
+side = "BOTH"
