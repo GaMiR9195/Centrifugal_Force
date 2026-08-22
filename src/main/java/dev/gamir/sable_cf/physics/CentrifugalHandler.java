@@ -2,7 +2,6 @@ package dev.gamir.sable_cf.physics;
 
 import dev.gamir.sable_cf.CfConfig;
 import dev.gamir.sable_cf.compat.SableAccess;
-import dev.ryanhcode.sable.companion.math.Pose3dc;
 import dev.ryanhcode.sable.sublevel.SubLevel;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -10,310 +9,304 @@ import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import org.joml.Vector3d;
-import org.joml.Vector3dc;
 
 /**
- * The physics tick. Runs once per client tick for the local player only.
+ * Turns the body frame into actual movement: drag, friction, sliding, being thrown off.
  *
- * <h2>The model</h2>
+ * <h2>The three states, and why they are one formula</h2>
  *
- * <p>Standing in a rotating frame, a body feels gravity plus three fictitious accelerations:
- * centrifugal {@code -w x (w x r)}, Euler {@code -a x r} and Coriolis {@code -2 w x v}. Add those
- * to gravity and you get <i>apparent gravity</i> - the direction the inner ear calls down. Every
- * single behaviour this mod is supposed to have falls out of that one vector:</p>
+ * <p>Standing, sliding and being swept off are not three code paths with thresholds between them.
+ * They are the same Coulomb friction comparison - can the feet hold the sideways load - evaluated
+ * every tick. The load grows smoothly with speed, so the transitions arrive smoothly too, and the
+ * middle state is a real state you can be in and fight rather than a frame you pass through.</p>
  *
- * <ul>
- *   <li>Spin a drum of radius r at w and the outward term is {@code w^2 * r}. Past 1 g it beats
- *       gravity, apparent down points at the wall, and the wall is now the floor. At 5 blocks that
- *       is about 2.5 rad/s, roughly 24 rpm - which is genuinely what a rotor ride spins at.</li>
- *   <li>Drag is {@code g * (v / reference)^2} against the player's speed <i>through the air</i>.
- *       On a spinner that is dominated by the deck's own tangential speed, so a fast ride is
- *       trying to peel you off even while you stand still.</li>
- *   <li>Friction holds up to {@code mu * normal_load} of tangential force and no more. Under the
- *       limit you stand; over it, only the excess moves you, so you slide slowly near the limit
- *       and fast well past it. Both terms grow with w, but drag grows as {@code (w*r)^2} while the
- *       press grows only as {@code w^2 * r} - so drag always wins eventually. Getting swept off a
- *       fast ride is not a special case in here, it is just the arithmetic.</li>
- * </ul>
+ * <h2>Where the rotation enters the sweep-off</h2>
  *
- * <h2>What is added to the player</h2>
+ * <p>Two separate places, and missing either one is what made being flung off a tilted spinner feel
+ * wrong:</p>
  *
- * <p>Only the difference from what vanilla already does. Vanilla applies gravity every tick, so
- * adding apparent gravity outright would double it. On a level, non-spinning deck this handler
- * therefore contributes exactly zero and normal play is untouched.</p>
+ * <ol>
+ *   <li><b>Air speed is the player's world velocity, not their walking velocity.</b> Sable carries
+ *       a standing player around with the deck, so their {@code deltaMovement} is relative to the
+ *       deck and is nearly zero while they stand still - but they are still being dragged through
+ *       the air at the deck's tangential speed, {@code omega x r}, which on a 5-block arm at 3 rad/s
+ *       is 15 m/s. Drag has to see that. This is the term whose absence made a fast spinner behave
+ *       like a gently tilted floor.</li>
+ *   <li><b>The frame acceleration is Sable's own velocity field differentiated in time</b>, so it
+ *       contains the centrifugal term, the Euler term from the spin changing rate, and any linear
+ *       acceleration of the contraption - see {@link BodyFrame}. The old hand-rolled version had
+ *       only the first of the three.</li>
+ * </ol>
+ *
+ * <h2>Why velocity is added rather than set</h2>
+ *
+ * <p>Sable resolves collisions in up to eight substeps per tick and Sure Footing rewrites tracking
+ * every tick in mid-air. Assigning a velocity means whoever writes last wins, and the result is a
+ * fight that shows up as stutter. Adding an increment composes with both of them instead.</p>
  */
 public final class CentrifugalHandler {
 
-    /** Last tick's result, for the camera and the overlay. */
-    public static final ForceState STATE = new ForceState();
-
     /**
-     * Candidate surface normals, in the sub-level's own local space.
-     *
-     * <p>Deliberately not a raycast. Hits on sub-level blocks come back in the sub-level's own
-     * coordinate space - millions of blocks from the player - so every result would need converting
-     * and disambiguating. A deck is block geometry, so its normal is always one of these six axes,
-     * and picking the one most opposed to felt down is both cheaper and exact. It also makes the
-     * floor-to-wall handover inside a drum free: as the spin builds, the winning axis just changes.</p>
+     * m/s^2 to blocks/tick. One factor of 20 converts per-second to per-tick, the other converts
+     * m/s to blocks/tick, because Minecraft velocities are blocks per tick and Sable's are m/s.
      */
-    private static final Vec3[] LOCAL_AXES = {
-            new Vec3(0.0, 1.0, 0.0), new Vec3(0.0, -1.0, 0.0),
-            new Vec3(1.0, 0.0, 0.0), new Vec3(-1.0, 0.0, 0.0),
-            new Vec3(0.0, 0.0, 1.0), new Vec3(0.0, 0.0, -1.0),
-    };
+    private static final double ACCEL_TO_DELTA = 1.0 / 400.0;
 
-    private final FrameSample frame = new FrameSample();
+    /** cos(60 degrees): steeper than this and it is a wall, not a slope. Display only. */
+    private static final double WALL_COSINE = 0.5;
 
-    private LocalPlayer owner;
-    private boolean wasGripped;
+    public static final ForceState STATE = new ForceState();
 
     @SubscribeEvent
     public void onClientTick(final ClientTickEvent.Post event) {
         final Minecraft minecraft = Minecraft.getInstance();
         final LocalPlayer player = minecraft.player;
 
-        if (player == null || minecraft.level == null || !CfConfig.SPEC.isLoaded()) {
-            this.stop();
-            this.owner = null;
-            return;
-        }
-
-        // Respawn or dimension change hands us a different LocalPlayer object. The stored pose
-        // delta belongs to the old one, and using it would kick the new one once.
-        if (this.owner != player) {
-            this.owner = player;
-            this.stop();
-        }
-
-        if (!CfConfig.CENTRIFUGAL_ENABLED.get() && !CfConfig.AIR_ENABLED.get()) {
-            this.stop();
-            return;
-        }
-
-        final SubLevel subLevel = SableAccess.tracking(player);
-
-        // isPassenger: sitting in a seat is Create's/Sable's problem, not ours - it already moves
-        // you rigidly. flying/fallFlying/spectator: the player has explicitly opted out of footing.
-        if (subLevel == null
-                || subLevel.isRemoved()
-                || subLevel.getLevel() != player.level()
-                || player.isSpectator()
-                || player.getAbilities().flying
-                || player.isFallFlying()
-                || player.isPassenger()) {
-            this.stop();
-            return;
-        }
-
-        this.frame.sample(subLevel);
-
-        // First tick on this sub-level: there is no pose delta yet, so every rate would be a lie.
-        if (!this.frame.isValid()) {
+        if (player == null || minecraft.level == null || minecraft.isPaused() || !CfConfig.SPEC.isLoaded()) {
             STATE.clear();
             return;
         }
 
-        this.apply(player, subLevel);
-    }
+        if (!(player instanceof BodyFrameHolder holder)) {
+            STATE.clear();
+            return;
+        }
 
-    private void stop() {
-        this.frame.reset();
-        this.wasGripped = false;
-        STATE.clear();
-    }
+        final BodyFrame frame = holder.sable_cf$bodyFrameOrNull();
+        final SubLevel subLevel = SableAccess.tracking(player);
 
-    private void apply(final LocalPlayer player, final SubLevel subLevel) {
-        final Pose3dc pose = subLevel.logicalPose();
-        final Vec3 positionVec = player.position();
-        final Vec3 deltaMovement = player.getDeltaMovement();
+        if (frame == null || !frame.isActive() || subLevel == null || subLevel.isRemoved()) {
+            STATE.clear();
+            return;
+        }
 
-        // r is measured from the pose origin because that is the point Sable itself rotates about -
-        // its own getVelocity() is w x (worldPos - pose.position()) + linear.
-        final Vector3d radius = new Vector3d(positionVec.x, positionVec.y, positionVec.z)
-                .sub(pose.position());
+        if (player.isPassenger() || player.isSpectator() || player.getAbilities().flying) {
+            STATE.clear();
+            return;
+        }
 
-        final Vector3dc omega = this.frame.omega();
+        final Vec3 position = player.position();
 
-        final Vector3d gravity = new Vector3d(0.0, -CfConfig.GRAVITY, 0.0);
+        // --- velocities ---------------------------------------------------------------
 
-        // The player's velocity as measured in the rotating frame. deltaMovement is already
-        // frame-relative: while you are tracked, Sable warps your position with the sub-level, so
-        // the frame's own motion never appears in here. Times 20 to get m/s.
-        final Vector3d relativeVelocity =
-                new Vector3d(deltaMovement.x, deltaMovement.y, deltaMovement.z).mul(20.0);
+        // The deck's own velocity here. This is omega x r plus any drift, computed by Sable from
+        // its pose delta, so it is exact and needs no rotation centre guessed on this side.
+        final Vec3 deck = SableAccess.pointVelocity(subLevel, position);
 
-        final Vector3d omegaCrossR = new Vector3d(omega).cross(radius, new Vector3d());
-        final Vector3d centrifugal = new Vector3d(omega).cross(omegaCrossR, new Vector3d()).negate();
-        final Vector3d euler = new Vector3d(this.frame.alpha()).cross(radius, new Vector3d()).negate();
-        final Vector3d coriolis = new Vector3d(omega).cross(relativeVelocity, new Vector3d()).mul(-2.0);
+        final Vec3 own = player.getDeltaMovement().scale(20.0);
 
-        final Vector3d extra = new Vector3d();
+        // World velocity = carried by the deck + walking on top of it. The first term is the one
+        // that makes a spinner able to throw you off at all.
+        final Vector3d world = new Vector3d(deck.x + own.x, deck.y + own.y, deck.z + own.z);
+
+        final Vec3 wind = SableAccess.wind(minecraft.level, position);
+
+        final Vector3d air = new Vector3d(world).sub(wind.x, wind.y, wind.z);
+
+        // --- accelerations -----------------------------------------------------------
+
+        final Vector3d apparent = new Vector3d(frame.apparent());
+
+        final Vector3d coriolis = new Vector3d();
 
         if (CfConfig.CENTRIFUGAL_ENABLED.get()) {
-            extra.add(new Vector3d(centrifugal).mul(CfConfig.CENTRIFUGAL_STRENGTH.get()))
-                    .add(new Vector3d(euler).mul(CfConfig.EULER_STRENGTH.get()))
-                    .add(new Vector3d(coriolis).mul(CfConfig.CORIOLIS_STRENGTH.get()));
+            final double coriolisStrength = CfConfig.CORIOLIS_STRENGTH.get();
+
+            if (coriolisStrength > 0.0) {
+                // -2 omega x v_rel. v_rel is the player's own movement, which is why this term and
+                // no other has to be kept out of the camera's target.
+                new Vector3d(frame.omega()).cross(own.x, own.y, own.z, coriolis)
+                        .mul(-2.0 * coriolisStrength);
+
+                if (!coriolis.isFinite()) {
+                    coriolis.zero();
+                }
+
+                apparent.add(coriolis);
+            }
         }
-
-        final Vector3d apparent = new Vector3d(gravity).add(extra);
-
-        // Which way is down, as felt. Drag is excluded on purpose: wind should not be able to
-        // convince you that a wall is the floor.
-        final Vector3d down = new Vector3d(apparent);
-        if (down.lengthSquared() < 1.0e-9) {
-            down.set(0.0, -1.0, 0.0);
-        } else {
-            down.normalize();
-        }
-
-        final Vector3d normal = surfaceNormal(pose, down);
-
-        // --- air ---
-
-        final Vec3 deckVelocity = SableAccess.pointVelocity(subLevel, positionVec);
-        final Vec3 wind = SableAccess.wind(player.level(), positionVec);
-
-        final Vector3d airVelocity = new Vector3d(deckVelocity.x, deckVelocity.y, deckVelocity.z)
-                .add(relativeVelocity)
-                .sub(wind.x, wind.y, wind.z);
 
         final Vector3d drag = new Vector3d();
-        final double airSpeed = airVelocity.length();
 
-        if (CfConfig.AIR_ENABLED.get() && airSpeed > 1.0e-4 && Double.isFinite(airSpeed)) {
-            final double reference = CfConfig.AIR_REFERENCE_SPEED.get();
-            // Quadratic, and normalised so that |a| == gravity exactly at v == reference. That is
-            // what makes the knob a speed you can picture instead of a multiplier you cannot.
-            final double magnitude = CfConfig.GRAVITY * (airSpeed * airSpeed) / (reference * reference);
-            drag.set(airVelocity).div(airSpeed).mul(-magnitude);
+        if (CfConfig.AIR_ENABLED.get()) {
+            final double airSpeed = air.length();
+
+            if (airSpeed > 1.0e-4) {
+                drag.set(air).div(airSpeed).mul(-CfConfig.dragMagnitude(airSpeed));
+
+                if (!drag.isFinite()) {
+                    drag.zero();
+                }
+            }
         }
 
-        // --- footing ---
+        // --- grip decision -----------------------------------------------------------
 
-        final Vector3d extraTotal = new Vector3d(extra).add(drag);
-        final Vector3d total = new Vector3d(gravity).add(extraTotal);
+        final Vector3d normal = new Vector3d(frame.normal());
 
-        final double press = -total.dot(normal);
+        // Deliberate and readable: a surface holds you when the load pressing you into it exceeds a
+        // threshold. Nothing here depends on which collision face Sable happened to resolve last,
+        // which is what made sticking to a drum wall a matter of luck before.
+        final double press = -apparent.dot(normal);
 
-        // Cheap contact test. Sable does keep a real contact manifold, but only behind
-        // EntityMovementExtension#sable$getCollisionInfo(), which is internal - see docs/UPSTREAM.md.
-        // These three flags are the same signals Sure Footing trusts.
-        final boolean touching = player.onGround() || player.verticalCollision || player.horizontalCollision;
-        final boolean gripped = touching && press >= CfConfig.GRIP_MIN_PRESS_G.get() * CfConfig.GRAVITY;
+        final boolean touching = player.onGround()
+                || player.verticalCollision
+                || player.horizontalCollision
+                || frame.tilt() > 0.35;
 
-        final boolean bracing = player.isShiftKeyDown();
-        final double friction = CfConfig.GRIP_FRICTION.get()
-                * (bracing ? CfConfig.GRIP_BRACE_BONUS.get() : 1.0);
-        final double hold = friction * Math.max(0.0, press);
+        final boolean gripEnabled = CfConfig.GRIP_ENABLED.get();
+
+        final boolean gripped = touching
+                && gripEnabled
+                && press >= CfConfig.GRIP_MIN_PRESS_G.get() * CfConfig.GRAVITY;
+
+        // Total load, including drag, resolved into "into the surface" and "along the surface".
+        final Vector3d total = new Vector3d(apparent).add(drag);
 
         final Vector3d tangential = new Vector3d(total)
                 .sub(new Vector3d(normal).mul(total.dot(normal)));
+
         final double tangentialLoad = tangential.length();
 
+        final boolean bracing = player.isShiftKeyDown();
+
+        final double hold = gripped
+                ? CfConfig.GRIP_STRENGTH.get() * press * (bracing ? CfConfig.GRIP_BRACE_BONUS.get() : 1.0)
+                : 0.0;
+
         final Vector3d applied = new Vector3d();
-        boolean slipping;
+        boolean slipping = false;
 
-        if (gripped) {
-            final double surviving = Math.max(0.0, tangentialLoad - hold);
-            slipping = surviving > 1.0e-6;
-
-            final Vector3d slide = new Vector3d();
-            if (tangentialLoad > 1.0e-9) {
-                slide.set(tangential).div(tangentialLoad).mul(surviving);
-            }
-
-            // Vanilla is already pushing you down the slope with gravity's tangential share, so to
-            // end up with only `slide` we have to add the difference. When friction wins that
-            // difference is negative - and a negative addition IS the friction. This is also why a
-            // merely tilted deck stops sliding you at all: g*(sin - mu*cos) is exactly zero there.
-            final Vector3d tangentialGravity = new Vector3d(gravity)
-                    .sub(new Vector3d(normal).mul(gravity.dot(normal)));
-
-            applied.set(normal).mul(extraTotal.dot(normal))
-                    .add(slide)
-                    .sub(tangentialGravity);
+        if (!gripped) {
+            // Nothing holding you: the full felt acceleration applies and you go where it points.
+            // On a spinner that is outward and tangential, which is the correct way to leave.
+            applied.set(total);
+            slipping = true;
+        } else if (tangentialLoad <= hold) {
+            // Static friction wins. Cancel the slide exactly - not approximately, or you creep.
+            applied.set(tangential).negate();
         } else {
-            // Nothing is holding you. Everything applies, which is what makes the arc off a
-            // spinner look right.
-            applied.set(extraTotal);
+            // Kinetic: friction removes what it can and the rest accelerates you along the surface.
+            // The residual fraction is what makes sliding controllable instead of instant.
+            final double residual = 1.0 - hold / tangentialLoad;
+            applied.set(tangential).mul(residual);
             slipping = true;
         }
 
+        // Safety clamp. A contraption that teleports produces one tick of nonsense acceleration,
+        // and without this that single tick launches the player out of the world.
         final double limit = CfConfig.MAX_ACCEL_G.get() * CfConfig.GRAVITY;
         final double magnitude = applied.length();
 
-        if (!applied.isFinite()) {
-            applied.zero();
-        } else if (magnitude > limit && magnitude > 1.0e-9) {
+        if (magnitude > limit && magnitude > 0.0) {
             applied.mul(limit / magnitude);
         }
 
-        // a m/s^2 for one tick is a/20 m/s, which is a/400 blocks/tick.
-        if (applied.lengthSquared() > 1.0e-12) {
-            player.setDeltaMovement(deltaMovement.add(
-                    applied.x / 400.0, applied.y / 400.0, applied.z / 400.0));
+        if (!applied.isFinite()) {
+            applied.zero();
         }
 
-        // Being pressed into a wall at several g racks up fall distance you did not earn. Note this
-        // is only the client's counter: the server keeps its own from position deltas, so this
-        // softens the problem rather than solving it. See README.
-        if (gripped && press > 1.5 * CfConfig.GRAVITY) {
+        player.setDeltaMovement(player.getDeltaMovement().add(
+                applied.x * ACCEL_TO_DELTA,
+                applied.y * ACCEL_TO_DELTA,
+                applied.z * ACCEL_TO_DELTA));
+
+        // Being pressed into a surface is not falling. Without this, standing inside a drum bills
+        // you for fall damage the moment you touch anything.
+        if (press > 1.5 * CfConfig.GRAVITY) {
             player.resetFallDistance();
         }
 
-        if (CfConfig.RELEASE_TRACKING.get()
-                && this.wasGripped
-                && !gripped
-                && deckVelocity.length() >= CfConfig.RELEASE_SPEED.get()) {
-            // Off by default. Sable already hands over an inherited velocity when tracking ends -
-            // that is why we do NOT add deckVelocity by hand here; doing both would count the
-            // deck's momentum twice. All this does is end the tracking sooner.
-            SableAccess.setTracking(player, null);
-        }
-
-        this.wasGripped = gripped;
+        // --- publish ------------------------------------------------------------------
 
         STATE.active = true;
-        STATE.centrifugal.set(centrifugal);
-        STATE.euler.set(euler);
+        STATE.frameAcceleration.set(frame.frameAcceleration());
         STATE.coriolis.set(coriolis);
         STATE.drag.set(drag);
         STATE.apparent.set(apparent);
         STATE.applied.set(applied);
+        STATE.airVelocity.set(air);
+        STATE.deckVelocity.set(deck.x, deck.y, deck.z);
+        STATE.relativeVelocity.set(own.x, own.y, own.z);
+        STATE.omega.set(frame.omega());
+        STATE.angularAcceleration.set(frame.angularAcceleration());
         STATE.normal.set(normal);
-        STATE.airVelocity.set(airVelocity);
-        STATE.deckVelocity.set(deckVelocity.x, deckVelocity.y, deckVelocity.z);
-        STATE.omega.set(omega);
         STATE.press = press;
-        STATE.hold = hold;
         STATE.tangentialLoad = tangentialLoad;
+        STATE.hold = hold;
+        STATE.tilt = frame.tilt();
         STATE.gripped = gripped;
         STATE.slipping = slipping;
         STATE.bracing = bracing;
+        STATE.wallRide = gripped && normal.y() < WALL_COSINE;
+
+        // Slip is what you would see: motion along the surface relative to the deck.
+        STATE.slip.set(own.x, own.y, own.z);
+        STATE.slip.sub(new Vector3d(normal).mul(STATE.slip.dot(normal)));
+
+        decomposeFrameAcceleration(frame, position, subLevel);
     }
 
-    /** The sub-level face most opposed to felt down, as a unit world-space normal. */
-    private static Vector3d surfaceNormal(final Pose3dc pose, final Vector3dc down) {
-        final Vector3d best = new Vector3d(0.0, 1.0, 0.0);
-        double bestDot = -Double.MAX_VALUE;
+    /**
+     * Splits the frame acceleration into a centrifugal part and everything else, for the arrows.
+     *
+     * <p>Display only, and approximate on purpose. The physics never needs the split - it uses the
+     * total, which is exact - but an arrow labelled "centrifugal" that actually shows centrifugal
+     * plus Euler plus linear drift is not a debugging aid.</p>
+     *
+     * <p>Centrifugal always points directly away from the rotation axis, so the component of the
+     * frame acceleration along the radial direction is the centrifugal part, and the remainder is
+     * Euler plus linear. The radial direction comes from the pose, whose world origin is the
+     * rotation centre by construction: {@code transformPosition} maps the rotation point to the
+     * position, so that is the one point of the sub-level that rotation leaves alone.</p>
+     */
+    private static void decomposeFrameAcceleration(
+            final BodyFrame frame, final Vec3 position, final SubLevel subLevel) {
 
-        for (final Vec3 axis : LOCAL_AXES) {
-            final Vec3 world = pose.transformNormal(axis);
-            final double length = world.length();
+        final Vector3d total = new Vector3d(frame.frameAcceleration());
+        final Vector3d omega = new Vector3d(frame.omega());
 
-            if (length < 1.0e-9) {
-                continue;
-            }
+        final double spin = omega.length();
 
-            // transformNormal carries the sub-level's scale, so normalise before comparing.
-            final double dot = -(world.x * down.x() + world.y * down.y() + world.z * down.z()) / length;
-
-            if (dot > bestDot) {
-                bestDot = dot;
-                best.set(world.x / length, world.y / length, world.z / length);
-            }
+        if (spin < 1.0e-4) {
+            STATE.centrifugal.zero();
+            STATE.euler.set(total);
+            return;
         }
 
-        return best;
+        final Vector3d axis = new Vector3d(omega).div(spin);
+
+        final Vector3d centre = subLevel.logicalPose().position() instanceof org.joml.Vector3dc c
+                ? new Vector3d(c)
+                : new Vector3d();
+
+        final Vector3d radius = new Vector3d(position.x, position.y, position.z).sub(centre);
+
+        // Only the part of the radius perpendicular to the axis matters; sliding along the axis is
+        // not going round anything.
+        radius.sub(new Vector3d(axis).mul(radius.dot(axis)));
+
+        final double distance = radius.length();
+
+        if (distance < 1.0e-4) {
+            STATE.centrifugal.zero();
+            STATE.euler.set(total);
+            return;
+        }
+
+        radius.div(distance);
+
+        final double radial = total.dot(radius);
+
+        STATE.centrifugal.set(radius).mul(radial);
+        STATE.euler.set(total).sub(STATE.centrifugal);
+
+        if (!STATE.centrifugal.isFinite()) {
+            STATE.centrifugal.zero();
+        }
+
+        if (!STATE.euler.isFinite()) {
+            STATE.euler.zero();
+        }
     }
 }
