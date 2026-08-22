@@ -10,6 +10,8 @@ import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.shapes.BooleanOp;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import org.jetbrains.annotations.Nullable;
+import org.joml.Quaterniondc;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
@@ -18,33 +20,39 @@ import org.joml.Vector3dc;
  *
  * <h2>Why this exists</h2>
  *
- * <p>The previous approach picked the surface normal by asking which of the sub-level's six axes
+ * <p>The original approach picked the surface normal by asking which of the sub-level's six axes
  * best opposed felt-down. That is a guess about geometry made from a force, and it has one fatal
  * property: it always answers. Point felt-down sideways and it confidently reports a wall, whether
  * or not a wall is there - so a player standing on an ordinary deck could be tilted and shoved by a
- * surface that did not exist. Every symptom of "it drifts and leans while I just stand here" comes
- * back to that.</p>
+ * surface that did not exist.</p>
  *
  * <p>This asks the geometry instead. It is also what makes detection <i>global</i> rather than
  * floor-only: walls and ceilings are found the same way the floor is, so being pinned to the inside
- * of a drum, wedged in a corner, or pressed against a lip are all first-class states instead of
- * side effects.</p>
+ * of a drum, wedged in a corner, or hanging off the top of a loop are first-class states rather
+ * than side effects.</p>
+ *
+ * <h2>The probe follows the body</h2>
+ *
+ * <p>The box is built from the body's <i>oriented</i> extents, not from an upright box along local
+ * +Y. That was a real failure and not a refinement: once the body lay against a drum wall, an
+ * upright probe box went looking for a floor a metre below where the body actually was, found
+ * nothing, and reported no contacts at all - which zeroed the press, which dropped the tilt, which
+ * stood the body back up. Wall riding could not survive its own first tick.</p>
+ *
+ * <p>Enclosing an oriented box in an axis-aligned one does widen it, and that is fine <i>here</i>:
+ * this decides where to look for geometry. It is not the hitbox. What Sable is handed is an
+ * orientation, and Sable builds a genuine oriented box from it - nothing this class does reaches
+ * collision.</p>
  *
  * <h2>How it can query sub-level blocks at all</h2>
  *
  * <p>A sub-level's blocks live in the parent {@link Level}, in a plot far out from the origin -
- * Sable's own collision code walks them with plain {@code BlockPos} lookups on the level, in the
- * sub-level's local coordinates. So do we. The pose converts between the two spaces, and no
- * internal API is touched.</p>
+ * Sable's own collision code walks them with plain {@code BlockPos} lookups in the sub-level's
+ * local coordinates. So do we. The pose converts between the two spaces, and no internal API is
+ * touched.</p>
  *
  * <p>This is also why a raycast is the wrong tool: hits come back in local space millions of blocks
- * away, and a ray answers about one point rather than about a face. A shell test around the body
- * answers the question that was actually asked.</p>
- *
- * <h2>Cost</h2>
- *
- * <p>Six thin slabs, each a handful of blocks, once per player per tick. The whole probe is skipped
- * for anyone not on a sub-level, which is almost everyone almost always.</p>
+ * away, and a ray answers about one point rather than about a face.</p>
  */
 public final class ContactProbe {
 
@@ -116,9 +124,15 @@ public final class ContactProbe {
     /**
      * Refills the contact set for this entity against this sub-level.
      *
+     * @param bodyOrientation the body's current orientation, or null for upright. One tick stale by
+     *                        construction - the tilt is derived from the contacts - which is
+     *                        harmless at a 0.16 s orientation half-life and is what breaks the
+     *                        circular dependency.
      * @return the number of contacting faces
      */
-    public int probe(final Entity entity, final SubLevel subLevel) {
+    public int probe(final Entity entity, final SubLevel subLevel,
+                     @Nullable final Quaterniondc bodyOrientation) {
+
         this.clear();
 
         final Level level = subLevel.getLevel();
@@ -130,11 +144,9 @@ public final class ContactProbe {
         final Pose3dc pose = subLevel.logicalPose();
         final Vector3dc scale = pose.scale();
 
-        final double sx = Math.abs(scale.x());
-        final double sy = Math.abs(scale.y());
-        final double sz = Math.abs(scale.z());
-
-        if (!(sx > 1.0e-6) || !(sy > 1.0e-6) || !(sz > 1.0e-6)) {
+        if (!(Math.abs(scale.x()) > 1.0e-6)
+                || !(Math.abs(scale.y()) > 1.0e-6)
+                || !(Math.abs(scale.z()) > 1.0e-6)) {
             return 0;
         }
 
@@ -152,22 +164,42 @@ public final class ContactProbe {
             return 0;
         }
 
-        // The body in the deck's own frame. Axis-aligned there by construction, which is exactly
-        // the box Sable's oriented collision ends up testing once we supply an orientation.
-        final double hx = (width * 0.5) / sx;
-        final double hy = (height * 0.5) / sy;
-        final double hz = (width * 0.5) / sz;
+        // The body's three half-axis vectors, in local space. transformNormalInverse carries the
+        // inverse scale, so these are already in local units and no division is needed.
+        final Vector3d halfX = localHalfAxis(pose, bodyOrientation, width * 0.5, 0.0, 0.0);
+        final Vector3d halfY = localHalfAxis(pose, bodyOrientation, 0.0, height * 0.5, 0.0);
+        final Vector3d halfZ = localHalfAxis(pose, bodyOrientation, 0.0, 0.0, width * 0.5);
+
+        if (halfX == null || halfY == null || halfZ == null) {
+            return 0;
+        }
+
+        // Half the body's height along its OWN up, which is where its centre is. Upright this is
+        // the familiar feet + height/2; lying against a wall it is off to the side, which is the
+        // entire point.
+        final Vector3d centre = new Vector3d(feet).add(halfY);
+
+        // Enclosing half-extents of the oriented body along each local axis - the standard
+        // OBB-to-AABB projection. Exact when upright and when fully on a wall; only loose at the
+        // 45 degree midpoint, where a slightly generous search area is the safe direction to err.
+        final double extentX = Math.abs(halfX.x) + Math.abs(halfY.x) + Math.abs(halfZ.x);
+        final double extentY = Math.abs(halfX.y) + Math.abs(halfY.y) + Math.abs(halfZ.y);
+        final double extentZ = Math.abs(halfX.z) + Math.abs(halfY.z) + Math.abs(halfZ.z);
+
+        if (!(extentX > 0.0) || !(extentY > 0.0) || !(extentZ > 0.0)) {
+            return 0;
+        }
 
         final AABB body = new AABB(
-                feet.x - hx, feet.y, feet.z - hz,
-                feet.x + hx, feet.y + height / sy, feet.z + hz);
+                centre.x - extentX, centre.y - extentY, centre.z - extentZ,
+                centre.x + extentX, centre.y + extentY, centre.z + extentZ);
 
         for (int i = 0; i < AXIS_COUNT; i++) {
             final int[] axis = AXES[i];
 
             final AABB slab = shell(body, axis);
 
-            if (slab == null || !occupied(level, entity, slab)) {
+            if (slab == null || !occupied(level, slab)) {
                 continue;
             }
 
@@ -190,6 +222,25 @@ public final class ContactProbe {
         return this.count;
     }
 
+    /** One half-axis of the body, rotated into the body's orientation and then into local space. */
+    @Nullable
+    private static Vector3d localHalfAxis(final Pose3dc pose,
+                                          @Nullable final Quaterniondc orientation,
+                                          final double x, final double y, final double z) {
+
+        final Vector3d axis = new Vector3d(x, y, z);
+
+        if (orientation != null) {
+            orientation.transform(axis);
+        }
+
+        final Vector3d local = new Vector3d();
+
+        pose.transformNormalInverse(axis, local);
+
+        return local.isFinite() ? local : null;
+    }
+
     /**
      * The thin slab just outside the face opposite {@code axis}.
      *
@@ -197,6 +248,7 @@ public final class ContactProbe {
      * feet. Reading it the other way round is the classic sign error here, so: the face whose
      * normal points at you is the face you are resting on.</p>
      */
+    @Nullable
     private static AABB shell(final AABB body, final int[] axis) {
         double minX = body.minX + SIDE_SHRINK;
         double maxX = body.maxX - SIDE_SHRINK;
@@ -246,7 +298,7 @@ public final class ContactProbe {
      * the point: an approximate contact test produces phantom walls, and a phantom wall is exactly
      * the failure this class exists to remove.</p>
      */
-    private static boolean occupied(final Level level, final Entity entity, final AABB slab) {
+    private static boolean occupied(final Level level, final AABB slab) {
         final int minX = (int) Math.floor(slab.minX);
         final int minY = (int) Math.floor(slab.minY);
         final int minZ = (int) Math.floor(slab.minZ);

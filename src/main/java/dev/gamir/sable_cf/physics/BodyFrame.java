@@ -21,6 +21,15 @@ import java.util.UUID;
  * truth for contacts, the surface normal, the normal load and the body orientation, so the hitbox,
  * the physics and the camera cannot disagree with each other.
  *
+ * <h2>The sign that matters</h2>
+ *
+ * <p>{@code apparent = gravity - a_frame}. Therefore the ride's share of the normal load is
+ * {@code +(a_frame . n)}, because {@code press = -apparent . n = -(gravity . n) + (a_frame . n)}.
+ * Getting that backwards zeroes the ride share on exactly the surface where it should be largest -
+ * a drum wall, where the deck's centripetal acceleration and the wall normal both point inward -
+ * and a zero ride share silently disables the tilt, the hitbox rotation, the attach and the climb
+ * all at once. Every one of those features is downstream of this one dot product.</p>
+ *
  * <h2>Why this runs on both sides</h2>
  *
  * <p>The orientation is read by Sable's collision path, which runs on both sides. Rather than
@@ -30,19 +39,18 @@ import java.util.UUID;
  *
  * <h2>What it supplies to the hitbox, and what it deliberately does not</h2>
  *
- * <p>It supplies an <b>orientation</b> and stops there. It used to also re-fit a rotated box into
- * an axis-aligned one, which necessarily widened it - the source of the wedging warning that used
- * to be in the README, and of players being shoved out of geometry.</p>
+ * <p>It supplies an <b>orientation</b> and stops there. Sable's {@code SubLevelEntityCollision}
+ * takes the entity's <i>unrotated</i> {@code getXsize/getYsize/getZsize}, combines them with this
+ * quaternion, and runs SAT against sub-level blocks - genuine oriented-box collision. It expands
+ * its own broadphase by the eye height and pivots the body about eye height rather than the feet.
+ * It also already snaps the box's yaw to the sub-level's grid on its own, so the body is square to
+ * the contraption rather than to the world without this mod doing anything about it.</p>
  *
- * <p>That was never needed. Sable's {@code SubLevelEntityCollision} takes the entity's
- * <i>unrotated</i> {@code getXsize/getYsize/getZsize}, combines them with the quaternion from
- * {@code getCustomEntityOrientation}, and runs SAT against sub-level blocks - genuine oriented-box
- * collision. It expands its own broadphase by the eye height, and it pivots the body about eye
- * height rather than the feet. So a hand-rolled enclosing AABB was not merely redundant, it
- * disagreed with Sable's own pivot, and since it fed vanilla's box it could only ever act against
- * <i>main-level</i> geometry - which is exactly the wedging. Rotating is the whole job.</p>
+ * <p>So a hand-rolled enclosing AABB would not merely be redundant, it would disagree with Sable's
+ * pivot, and since it feeds vanilla's box it could only ever act against <i>main-level</i>
+ * geometry. Rotating is the whole job.</p>
  *
- * <h2>Where the frame acceleration comes from, and why it is filtered</h2>
+ * <h2>Where the frame acceleration comes from, and why it is filtered where it is</h2>
  *
  * <p>Sable's {@code getVelocity} is sampled at a <i>fixed material point</i> of the sub-level on
  * two consecutive ticks and differenced. Because the point is fixed in the sub-level rather than in
@@ -51,9 +59,11 @@ import java.util.UUID;
  * rotation centre and scale handled by Sable.</p>
  *
  * <p>It is also a <i>second</i> difference of a pose that arrives over the network and is
- * interpolated on the way in, which makes it noisy in a way no amount of correct algebra fixes.
- * Hence the low-pass and the dead zone in {@link CfConfig}: below the dead zone the value is
- * exactly zero, so a sub-level that is merely travelling contributes literally nothing.</p>
+ * interpolated on the way in, so it needs a low-pass. That low-pass runs in the <b>sub-level's own
+ * frame</b>. In world space a steady spin is a rotating vector, and a first-order lag does not just
+ * smooth a rotating vector, it rotates it backwards - about 16 degrees at 2.5 rad/s - which shows
+ * up as a permanent sideways shove that friction has to fight. In the deck's frame the same signal
+ * is constant, so the filter has nothing to lag.</p>
  */
 public final class BodyFrame {
 
@@ -63,6 +73,9 @@ public final class BodyFrame {
 
     /** Ticks the attach is suppressed for after a deliberate release. */
     private static final int RELEASE_COOLDOWN = 10;
+
+    /** Faster than this across the deck is a teleport or a re-anchor, not a slide. */
+    private static final double MAX_DECK_RELATIVE = 100.0;
 
     // ---------------------------------------------------------------- outputs
 
@@ -80,16 +93,25 @@ public final class BodyFrame {
     /** Unfiltered. Only for release detection, where a genuine spike is the signal. */
     private final Vector3d frameAccelerationRaw = new Vector3d();
 
-    private final Vector3d filtered = new Vector3d();
+    /** Low-pass state, held in the SUB-LEVEL's frame. See the class note. */
+    private final Vector3d filteredLocal = new Vector3d();
+
     private final Vector3d omega = new Vector3d();
     private final Vector3d angularAcceleration = new Vector3d();
 
     /** Rigid translation of the sub-level, m/s: the bit that is NOT rotation. */
     private final Vector3d deckTranslation = new Vector3d();
 
+    /** The player's own velocity across the deck, m/s, world space. */
+    private final Vector3d deckRelative = new Vector3d();
+
+    /** A tilt axis that is defined even when the surface normal is straight down. */
+    private final Vector3d tiltAxisFallback = new Vector3d(1.0, 0.0, 0.0);
+
     private final ContactProbe contacts = new ContactProbe();
 
     private double press;
+    private double ridePress;
     private double tilt;
     private double spinGate;
     private double frameShare;
@@ -160,13 +182,32 @@ public final class BodyFrame {
         return this.deckTranslation;
     }
 
+    /**
+     * The player's velocity across the deck, m/s, world space.
+     *
+     * <p>Measured from the change in their <i>local</i> position, which is the only honest source.
+     * Sable carries a standing player by moving their position directly, so {@code deltaMovement}
+     * never contains the carry - and equally it never contains a slide caused by the carry falling
+     * behind. Any speed limit written against {@code deltaMovement} therefore reads zero while the
+     * player slides across the deck at three metres a second, which is how a capped outward creep
+     * turned into an uncapped one.</p>
+     */
+    public Vector3dc deckRelativeVelocity() {
+        return this.deckRelative;
+    }
+
     public ContactProbe contacts() {
         return this.contacts;
     }
 
-    /** Normal load from the deck terms alone, m/s^2. */
+    /** Total normal load, m/s^2: gravity and the ride together. */
     public double press() {
         return this.press;
+    }
+
+    /** The part of {@link #press()} the ride is responsible for, m/s^2. */
+    public double ridePress() {
+        return this.ridePress;
     }
 
     /** 0 = upright, 1 = fully aligned with the surface. */
@@ -185,6 +226,11 @@ public final class BodyFrame {
      * <p>The most load-bearing number in the mod. Standing on a deck - level, sloped, moving,
      * accelerating - this is near zero, and everything downstream that could tip or shove you is
      * scaled by it. Pinned inside a drum it is near one.</p>
+     *
+     * <p>Worth knowing when reading the overlay: on the flat FLOOR of a spinning drum this is also
+     * near zero, and correctly so. The centrifugal vector is horizontal there, so it presses you
+     * into the floor by nothing and only throws you outward. The share climbs as you reach the
+     * wall, which is what makes the floor-to-wall transition a ramp rather than a switch.</p>
      */
     public double frameShare() {
         return this.frameShare;
@@ -266,6 +312,8 @@ public final class BodyFrame {
             this.deckTranslation.zero();
         }
 
+        this.updateTiltAxis(pose);
+
         if (this.anchor == null || !this.anchor.equals(id)) {
             // Fresh sub-level: there is no previous sample, and inventing one is how you get a
             // one-tick kick every time somebody steps onto a contraption.
@@ -273,13 +321,16 @@ public final class BodyFrame {
             this.primed = false;
             this.frameAcceleration.zero();
             this.frameAccelerationRaw.zero();
-            this.filtered.zero();
+            this.filteredLocal.zero();
+            this.deckRelative.zero();
             this.omega.zero();
             this.previousOmega.zero();
             this.angularAcceleration.zero();
             this.attached = false;
             this.attachedIndex = -1;
         } else if (this.primed) {
+            this.sampleDeckRelative(pose, localPoint);
+
             // Velocity of LAST tick's material point, evaluated with THIS tick's pose. Same point
             // of the deck at two times, so the difference is a real acceleration.
             final Vec3 nowAtOldPoint = SableAccess.localPointVelocity(subLevel, this.lastLocalPoint);
@@ -294,21 +345,7 @@ public final class BodyFrame {
             }
 
             this.detectRelease(entity);
-
-            // Low-pass, then dead zone. The filter makes the pose noise small; the dead zone makes
-            // it nothing, so "standing on a moving platform" is arithmetically identical to
-            // standing on the ground rather than merely close to it.
-            final double alpha = CfConfig.smoothingAlpha(CfConfig.FRAME_ACCEL_HALF_LIFE, 1.0 / 20.0);
-
-            this.filtered.lerp(this.frameAccelerationRaw, alpha);
-
-            if (!this.filtered.isFinite()) {
-                this.filtered.zero();
-            }
-
-            final double gate = CfConfig.frameAccelGate(this.filtered.length());
-
-            this.frameAcceleration.set(this.filtered).mul(gate);
+            this.filterFrameAcceleration(pose);
 
             this.previousOmega.set(this.omega);
             this.sampleOmega(pose.orientation());
@@ -348,7 +385,9 @@ public final class BodyFrame {
 
         // --- contacts and surface ---
 
-        this.contacts.probe(entity, subLevel);
+        // The probe is handed the current orientation so it looks where the body actually is. One
+        // tick stale, which is what breaks the circle: the tilt is derived from the contacts.
+        this.contacts.probe(entity, subLevel, this.orientation);
 
         final boolean hasSurface = SurfaceEstimator.estimate(this.contacts, down, this.normal);
 
@@ -356,6 +395,7 @@ public final class BodyFrame {
             // Airborne. Nothing is holding you, so nothing may tilt or grip you. Enforced here
             // rather than trusted to thresholds elsewhere.
             this.press = 0.0;
+            this.ridePress = 0.0;
             this.frameShare = 0.0;
             this.attached = false;
             this.attachedIndex = -1;
@@ -366,31 +406,113 @@ public final class BodyFrame {
 
         this.press = Math.max(0.0, -this.apparent.dot(this.normal));
 
-        final double ridePress = Math.max(0.0,
-                -(this.frameAcceleration.x * strength * this.normal.x
-                        + this.frameAcceleration.y * strength * this.normal.y
-                        + this.frameAcceleration.z * strength * this.normal.z));
+        // POSITIVE. apparent = gravity - a_frame, so -apparent.n = -(gravity.n) + (a_frame.n) and
+        // the ride's half of that is the second term as written. The inverted version of this line
+        // returned zero on every drum wall in existence and took the tilt, the rotated hitbox, the
+        // attach and the wall climb down with it.
+        this.ridePress = Math.max(0.0, strength * (
+                this.frameAcceleration.x * this.normal.x
+                        + this.frameAcceleration.y * this.normal.y
+                        + this.frameAcceleration.z * this.normal.z));
 
         this.frameShare = this.press > 1.0e-6
-                ? Math.min(1.0, ridePress / this.press)
+                ? Math.min(1.0, this.ridePress / this.press)
                 : 0.0;
 
         this.updateAttachment(strength);
 
         // --- tilt ---
 
-        // Scaled by frameShare, and that is the whole regression fix. A person standing on a slope
-        // stands UPRIGHT - they do not grow perpendicular to the hillside - and a deck that is
-        // merely travelling is a slope. Only a ride actively pressing you into a surface rotates a
-        // body, so the tilt is gated on the ride's share of the load rather than on the load.
-        // Falls out for free: the partial tilt during a floor-to-wall climb, since the share ramps
-        // up as the centrifugal load takes over from gravity.
-        final double rideWeight = CfConfig.smoothstep(this.frameShare, 0.15, 0.6);
-        final double targetTilt = CfConfig.tiltFromPress(this.press) * rideWeight;
+        final double targetTilt =
+                CfConfig.tiltFromPress(this.press) * CfConfig.rideWeight(this.frameShare);
 
         this.relax(targetTilt);
 
         this.active = true;
+    }
+
+    /**
+     * Low-passes the frame acceleration in the sub-level's frame, then brings it back to world.
+     *
+     * <p>The round trip is exact: {@code transformNormal} and {@code transformNormalInverse} are
+     * inverses, scale included, so nothing is distorted by doing the filtering on the far side.</p>
+     */
+    private void filterFrameAcceleration(final Pose3dc pose) {
+        final Vector3d local = new Vector3d();
+
+        pose.transformNormalInverse(this.frameAccelerationRaw, local);
+
+        if (!local.isFinite()) {
+            local.zero();
+        }
+
+        final double alpha = CfConfig.smoothingAlpha(CfConfig.FRAME_ACCEL_HALF_LIFE, 1.0 / 20.0);
+
+        this.filteredLocal.lerp(local, alpha);
+
+        if (!this.filteredLocal.isFinite()) {
+            this.filteredLocal.zero();
+        }
+
+        final Vector3d world = new Vector3d();
+
+        pose.transformNormal(this.filteredLocal, world);
+
+        if (!world.isFinite()) {
+            this.frameAcceleration.zero();
+            return;
+        }
+
+        // Dead zone applied to the world magnitude, since that is the quantity every threshold in
+        // the mod is expressed in.
+        this.frameAcceleration.set(world).mul(CfConfig.frameAccelGate(world.length()));
+    }
+
+    /** Differences the player's local position to get their true velocity across the deck. */
+    private void sampleDeckRelative(final Pose3dc pose, final Vector3dc localPoint) {
+        final Vector3d localDelta = new Vector3d(localPoint).sub(this.lastLocalPoint).mul(20.0);
+        final Vector3d world = new Vector3d();
+
+        pose.transformNormal(localDelta, world);
+
+        if (!world.isFinite() || world.length() > MAX_DECK_RELATIVE) {
+            // A re-anchor or a teleport, not a slide. Feeding it in would produce one enormous
+            // sample that the limiter then believes for several ticks.
+            return;
+        }
+
+        final double alpha = CfConfig.smoothingAlpha(CfConfig.DECK_RELATIVE_HALF_LIFE, 1.0 / 20.0);
+
+        this.deckRelative.lerp(world, alpha);
+
+        if (!this.deckRelative.isFinite()) {
+            this.deckRelative.zero();
+        }
+    }
+
+    /**
+     * Keeps a tilt axis that stays defined when the surface normal points straight down.
+     *
+     * <p>Taken from the sub-level's own frame rather than from the player's facing, so it is stable
+     * from tick to tick and turns with the ride instead of with the mouse.</p>
+     */
+    private void updateTiltAxis(final Pose3dc pose) {
+        final Vector3d axis = new Vector3d();
+
+        pose.transformNormal(new Vector3d(1.0, 0.0, 0.0), axis);
+        axis.sub(0.0, axis.y, 0.0);
+
+        if (axis.lengthSquared() < 1.0e-9 || !axis.isFinite()) {
+            pose.transformNormal(new Vector3d(0.0, 0.0, 1.0), axis);
+            axis.sub(0.0, axis.y, 0.0);
+        }
+
+        if (axis.lengthSquared() < 1.0e-9 || !axis.isFinite()) {
+            this.tiltAxisFallback.set(1.0, 0.0, 0.0);
+            return;
+        }
+
+        this.tiltAxisFallback.set(axis.normalize());
     }
 
     /**
@@ -400,7 +522,17 @@ public final class BodyFrame {
         this.targetOrientation.identity();
 
         if (targetTilt > 1.0e-4) {
-            final Quaterniond full = new Quaterniond().rotationTo(WORLD_UP, this.normal);
+            final Quaterniond full = new Quaterniond();
+
+            if (this.normal.y < CfConfig.ANTIPARALLEL_COSINE) {
+                // Pinned to the top of a loop, the surface normal points straight down. A rotation
+                // from world up to its exact opposite has no unique axis - every perpendicular is a
+                // valid answer - and JOML picks one, so the body spins about something arbitrary.
+                full.rotationAxis(Math.PI,
+                        this.tiltAxisFallback.x, this.tiltAxisFallback.y, this.tiltAxisFallback.z);
+            } else {
+                full.rotationTo(WORLD_UP, this.normal);
+            }
 
             if (Double.isFinite(full.x) && Double.isFinite(full.w)) {
                 // Partial tilt: slerp from identity, so "halfway to the wall" is a real posture and
@@ -426,20 +558,20 @@ public final class BodyFrame {
     }
 
     /**
-     * Decides whether the player is latched to a wall.
+     * Decides whether the player is latched to a surface.
      *
      * <p>Three conditions, and each rules out a specific wrong behaviour:</p>
      *
      * <ul>
-     *   <li><b>It is a wall.</b> A real side contact, from the probe - not a direction inferred
-     *       from a force. Floors do not need latching and ceilings are not footing.</li>
-     *   <li><b>The ride is pressing you into it, not you.</b> {@code frameShare} above
-     *       {@code attach_share}. This is the answer to "only in the right scenarios": a drum
-     *       throwing you outward passes easily, walking into a wall on a calm contraption cannot,
-     *       so ordinary walls stay ordinary and you can still bounce off them.</li>
-     *   <li><b>Hard enough, with hysteresis.</b> Latches at {@code attach_press_g} and lets go
-     *       below {@code release_press_g}. Equal thresholds would flicker every tick at the
-     *       boundary, which is the coin-flip stickiness this replaces.</li>
+     *   <li><b>A real contact,</b> from the probe - not a direction inferred from a force.</li>
+     *   <li><b>The ride is pressing you into it, not gravity.</b> Share above {@code attach_share}.
+     *       This is the answer to "only in the right scenarios", and it is also why no test against
+     *       world up is needed or wanted: an ordinary floor is held by gravity, so its share is near
+     *       zero and it cannot latch, while the inside of a drum passes whether it is beside you,
+     *       below you, or above you at the top of a loop. A world-up test would reject that last
+     *       case as a ceiling, which is precisely the 360 degree ride this mod exists for.</li>
+     *   <li><b>Hard enough, with hysteresis.</b> Latches at {@code attach_press_g} and lets go below
+     *       {@code release_press_g}. Equal thresholds would flicker every tick at the boundary.</li>
      * </ul>
      *
      * <p>Rotation-gated, so nothing that is not spinning can latch anyone.</p>
@@ -469,20 +601,14 @@ public final class BodyFrame {
 
         final Vector3dc candidate = this.contacts.normal(best);
 
-        // A wall, not a floor or a ceiling.
-        if (Math.abs(candidate.dot(WORLD_UP)) >= CfConfig.WALL_COSINE) {
-            this.attached = false;
-            this.attachedIndex = -1;
-            return;
-        }
-
-        final double into = Math.max(0.0, -(
-                this.frameAcceleration.x * strength * candidate.x()
-                        + this.frameAcceleration.y * strength * candidate.y()
-                        + this.frameAcceleration.z * strength * candidate.z()));
+        // Same sign convention as press: the ride's contribution is +(a_frame . n).
+        final double into = Math.max(0.0, strength * (
+                this.frameAcceleration.x * candidate.x()
+                        + this.frameAcceleration.y * candidate.y()
+                        + this.frameAcceleration.z * candidate.z()));
 
         final double total = Math.max(0.0, -this.apparent.dot(candidate));
-        final double share = total > 1.0e-6 ? into / total : 0.0;
+        final double share = total > 1.0e-6 ? Math.min(1.0, into / total) : 0.0;
 
         if (share < CfConfig.ATTACH_SHARE.get()) {
             this.attached = false;
@@ -490,10 +616,9 @@ public final class BodyFrame {
             return;
         }
 
-        final double g = CfConfig.GRAVITY;
         final double threshold = this.attached && best == this.attachedIndex
-                ? CfConfig.ATTACH_RELEASE_G.get() * g
-                : CfConfig.ATTACH_PRESS_G.get() * g;
+                ? CfConfig.ATTACH_RELEASE_G.get() * CfConfig.GRAVITY
+                : CfConfig.ATTACH_PRESS_G.get() * CfConfig.GRAVITY;
 
         if (into * this.spinGate >= threshold) {
             this.attached = true;
@@ -530,8 +655,8 @@ public final class BodyFrame {
 
         final Vector3d direction = new Vector3d(this.lastPointVelocity).div(speed);
 
-        // Deceleration ALONG the direof travel. A turn is a large sideways acceleration and must
-        // not count; only losing the motion you had counts.
+        // Deceleration ALONG the direction of travel. A turn is a large sideways acceleration and
+        // must not count; only losing the motion you had counts.
         final double along = this.frameAccelerationRaw.dot(direction);
 
         if (along > -CfConfig.RELEASE_DECEL_G.get() * CfConfig.GRAVITY) {
@@ -583,13 +708,15 @@ public final class BodyFrame {
         this.anchor = null;
         this.primed = false;
         this.press = 0.0;
+        this.ridePress = 0.0;
         this.frameShare = 0.0;
         this.spinGate = 0.0;
         this.attached = false;
         this.attachedIndex = -1;
         this.frameAcceleration.zero();
         this.frameAccelerationRaw.zero();
-        this.filtered.zero();
+        this.filteredLocal.zero();
+        this.deckRelative.zero();
         this.omega.zero();
         this.previousOmega.zero();
         this.angularAcceleration.zero();
@@ -617,7 +744,9 @@ public final class BodyFrame {
     /**
      * The orientation to hand Sable's collision path, scaled by {@code hitbox.amount}.
      *
-     * <p>An orientation and nothing else. Sable does the oriented-box work.</p>
+     * <p>An orientation and nothing else. Sable does the oriented-box work, and it also snaps the
+     * box's yaw to the sub-level's grid by itself, so the body is already square to the contraption
+     * before this contributes anything.</p>
      *
      * @return the orientation, or null to leave the body upright
      */
