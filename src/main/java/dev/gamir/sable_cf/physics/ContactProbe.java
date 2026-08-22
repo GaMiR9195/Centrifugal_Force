@@ -1,5 +1,6 @@
 package dev.gamir.sable_cf.physics;
 
+import dev.gamir.sable_cf.CfConfig;
 import dev.ryanhcode.sable.companion.math.Pose3dc;
 import dev.ryanhcode.sable.sublevel.SubLevel;
 import net.minecraft.core.BlockPos;
@@ -66,22 +67,18 @@ public final class ContactProbe {
     public static final int AXIS_COUNT = 6;
 
     /**
-     * How far outside the body to look, in local blocks.
+     * How far outside the body to look, and how much to pull the slab in on its other two axes.
      *
-     * <p>Wide enough to survive Sable resolving contact to within a fraction of a block and to
-     * survive one tick of drift on a moving wall; narrow enough that a floor one block below is not
-     * mistaken for a floor you are standing on.</p>
+     * <p>Both live in {@link CfConfig} so the probe and the clearance test cannot drift apart. The
+     * depth is wide enough to survive Sable resolving contact to within a fraction of a block and
+     * one tick of drift on a moving wall, narrow enough that a floor one block below is not
+     * mistaken for a floor you are standing on. The shrink is what stops standing on a floor from
+     * also reporting both walls of the block you are inside, because the corner of the floor slab
+     * touches them - a face has to be genuinely in front of you, not diagonally adjacent.</p>
      */
-    private static final double PROBE_DEPTH = 0.12;
+    private static final double PROBE_DEPTH = CfConfig.PROBE_DEPTH;
 
-    /**
-     * How much to pull the slab in on its other two axes.
-     *
-     * <p>Without it, standing on a floor also reports both walls of the block you are inside,
-     * because the corner of the floor slab touches them. Shrinking the slab means a face has to be
-     * genuinely in front of you, not diagonally adjacent.</p>
-     */
-    private static final double SIDE_SHRINK = 0.08;
+    private static final double SIDE_SHRINK = CfConfig.PROBE_SIDE_SHRINK;
 
     private final boolean[] contact = new boolean[AXIS_COUNT];
     private final Vector3d[] normals = new Vector3d[AXIS_COUNT];
