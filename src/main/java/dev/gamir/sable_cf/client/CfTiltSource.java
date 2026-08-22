@@ -3,115 +3,74 @@ package dev.gamir.sable_cf.client;
 import com.playsi.aero_cam_sync.api.TiltContext;
 import com.playsi.aero_cam_sync.api.TiltSource;
 import dev.gamir.sable_cf.CfConfig;
-import dev.gamir.sable_cf.physics.CentrifugalHandler;
+import dev.gamir.sable_cf.physics.BodyFrame;
+import dev.gamir.sable_cf.physics.BodyFrameHolder;
 import dev.gamir.sable_cf.physics.CfMath;
-import dev.gamir.sable_cf.physics.ForceState;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.phys.Vec3;
+import org.joml.Quaterniondc;
 import org.joml.Quaternionf;
 import org.joml.Vector3d;
+import org.joml.Vector3dc;
 import org.joml.Vector3f;
 
 /**
- * Where the camera actually points.
+ * Where the camera thinks down is.
  *
- * <h2>The target is the body, not the force</h2>
+ * <h2>What the camera is allowed to know</h2>
  *
- * <p>This used to aim straight at felt gravity. That sounds right - balance tracks gravity - but it
- * produces a camera that rolls the entire centrifugal angle on every bank while the body it belongs
- * to stands bolt upright. A great deal of motion, none of it corresponding to anything the
- * character is doing, and it heels hardest exactly when you are least pinned.</p>
+ * <p>Exactly one thing: the plane the body has committed to, and how much of a wall-walker the
+ * player currently is. Both come from {@link BodyFrame}, which means the camera cannot disagree
+ * with the hitbox - they are two readings of the same decision, not two decisions that have to be
+ * kept in step. The old camera derived its own target from the felt-gravity vector, which is why
+ * it drifted away from the body in corners and lagged behind it in transitions.</p>
  *
- * <p>So the target is the <b>body's</b> up direction, computed once in {@code BodyFrame} and shared
- * with the hitbox. Three things follow, none of them tuned:</p>
+ * <h2>Lively, but interpolated</h2>
  *
- * <ul>
- *   <li>An ordinary deck - moving, accelerating, sloped, banking gently - rotates the body by
- *       nothing, because the body only leans when felt gravity has genuinely left world gravity and
- *       there is a non-floor face under it. So the camera does nothing either.</li>
- *   <li>A drum that genuinely pins you rotates body and camera together, so standing on the wall
- *       looks like standing on the wall rather than like the world falling over.</li>
- *   <li>The view and the hitbox cannot disagree, because there is one body orientation and both
- *       are derived from it.</li>
- * </ul>
- *
- * <h2>The lean, and why it is capped in degrees</h2>
- *
- * <p>A small explicit lean towards felt gravity is added on top. With the body as the target that
- * term is the only thing left that moves the view when you are <i>not</i> pinned, so it is what
- * stops a change of direction from going numb.</p>
- *
- * <p>It is clamped in absolute degrees rather than by its fraction, and that is the fix for turns
- * heeling over sickeningly. The angle a fraction scales is unbounded: a brisk turn puts felt
- * gravity 60 or 70 degrees off world up, and a quarter of that is still a violent roll. Turning the
- * fraction down far enough to tame the worst case also removed the response on the gentle changes
- * that were already pleasant. A cap keeps the small ones exactly as they were and saturates the
- * large ones.</p>
- *
- * <h2>Gentle, but not numb</h2>
- *
- * <ul>
- *   <li><b>Tremble.</b> The pose arrives over the network, so the target is never perfectly still.
- *       Fixed by filtering the <i>target</i> and applying a dead band to it - not by slowing the
- *       camera, which would have cost the response as well.</li>
- *   <li><b>Response.</b> Driven by how fast the target is swinging, rather than by the magnitude of
- *       the centrifugal vector. Magnitude is {@code omega^2 * r}: it grows with radius and with
- *       perfectly steady spin, so it reads large when nothing is happening and small for a genuine
- *       flick near the axis - exactly the "sometimes too much, sometimes nothing" instability.</li>
- * </ul>
- *
- * <h2>Three different signals, not one</h2>
+ * <p>Three things together, and it needs all three:</p>
  *
  * <ol>
- *   <li><b>A loop.</b> The body's up sweeps a full circle, so a camera that follows it honestly
- *       rolls 360 degrees. Detected by the <i>horizontal</i> component of the sub-level's angular
- *       velocity: a banked turn yaws about a vertical axis and is left alone, a flip rotates about
- *       a horizontal one. When detected, the target fades to a running average whose window tracks
- *       the revolution period.</li>
- *   <li><b>A sharp bank.</b> Should feel immediate. See {@link #joltBoost}.</li>
- *   <li><b>Walking about on a spinning deck.</b> Should feel like nothing at all. Handled by
- *       excluding Coriolis and by damping the spring harder.</li>
+ *   <li>The target is the <b>committed plane</b>, so it is a step function - it does not wobble
+ *       when the forces wobble, and there is nothing for the smoothing to chase.</li>
+ *   <li>{@link TiltSpring} is second order and critically damped, so the camera leans out with
+ *       momentum and arrives without bouncing. The old exponential smoothing plus dead band did
+ *       the opposite: fastest at the start, slowest at the end, and dead until a threshold
+ *       released it in one lump.</li>
+ *   <li>The target is extrapolated forward by {@code camera.lead_seconds}. A spring is always
+ *       slightly behind a moving target; leading it by a fixed, small amount cancels most of that
+ *       without adding any of the overshoot a lower damping would.</li>
  * </ol>
+ *
+ * <p>{@code camera.pitch_response} then takes a share off the vertical component only, because
+ * vertical camera motion is what makes people motion-sick and roll is what makes a ride read as a
+ * ride. It is applied to the spring's error rather than to its output, so the spring stays
+ * critically damped instead of permanently fighting a scaled-down result.</p>
+ *
+ * <h2>Claiming frames</h2>
+ *
+ * <p>Winning a frame in ACS means owning the crosshair, the reach rays, projectile direction and
+ * what the server is told - so this declines every frame it has nothing to say about, and keeps
+ * claiming only while the spring is still unwinding back to level. Letting go mid-lean would hand
+ * ACS a camera halfway over and produce exactly the snap this file exists to avoid.</p>
  */
 public final class CfTiltSource implements TiltSource {
 
+    /** Hard ceiling on how far ahead the lead may extrapolate, radians. */
+    private static final float MAX_LEAD = (float) Math.toRadians(45.0);
+
     private static final Vector3f WORLD_UP = new Vector3f(0.0f, 1.0f, 0.0f);
-
-    /**
-     * Rate at which the target swings, rad/s, that counts as a decisive change of direction. Only
-     * sets the scale of the response curve; the curve saturates, so this is not a threshold.
-     */
-    private static final double TURN_REFERENCE = 1.2;
-
-    /** Angular acceleration, rad/s^2, that counts as a decisive flick of the controls. */
-    private static final double JOLT_REFERENCE = 8.0;
-
-    /** Horizontal spin rate, rad/s, below which nothing is a loop - about one turn per seven seconds. */
-    private static final double LOOP_RATE_LOW = 0.9;
-
-    /** Horizontal spin rate, rad/s, above which it is unambiguously a loop - a flip every 2.5 s. */
-    private static final double LOOP_RATE_HIGH = 2.5;
-
-    /** Speed across the deck, m/s, treated as "fully walking". Roughly a sprint. */
-    private static final double WALK_REFERENCE = 4.3;
 
     private final TiltSpring spring = new TiltSpring();
 
-    /** Low-pass of the target. During a loop this is what the camera aims at instead. */
-    private final Vector3d averageUp = new Vector3d(0.0, 1.0, 0.0);
+    private final Quaternionf target = new Quaternionf();
+    private final Quaternionf lastTarget = new Quaternionf();
+    private final Quaternionf leadTarget = new Quaternionf();
+    private final Quaternionf scratch = new Quaternionf();
 
-    /** The target last frame, for measuring how fast it is swinging. */
-    private final Vector3d previousUp = new Vector3d(0.0, 1.0, 0.0);
+    private final Vector3f pitchAxis = new Vector3f(1.0f, 0.0f, 0.0f);
+    private final Vector3f work = new Vector3f();
 
-    /** The filtered rotation, before the dead band. */
-    private final Vector3f smoothTarget = new Vector3f();
-
-    /** The rotation the spring actually chases, after the dead band. */
-    private final Vector3f heldTarget = new Vector3f();
-
-    private double loopCharge;
-    private double walkCharge;
-    private double turnRate;
+    private boolean primed;
 
     @Override
     public boolean appliesTo(final TiltContext context) {
@@ -119,343 +78,170 @@ public final class CfTiltSource implements TiltSource {
             return false;
         }
 
-        // Third person is ACS's business; a rolled third-person camera is disorienting in a way
-        // that has nothing to do with what we are modelling.
-        if (!context.firstPerson()) {
+        final BodyFrame frame = frameOf(context.player());
+
+        if (frame == null) {
             return false;
         }
 
-        // Keep claiming the frame while the spring still has tilt to unwind. Handing it back
-        // mid-lean would snap the view level in one frame, which is the one camera artefact
-        // guaranteed to be noticed.
-        return CentrifugalHandler.STATE.active || this.spring.hasResidual();
+        // Keep the frame while unwinding, or the camera would be dropped mid-lean.
+        return frame.stick() > 0.0 || !this.spring.settled();
     }
 
     @Override
     public Quaternionf tilt(final TiltContext context) {
-        // Never ask ACS for its state from in here - AcsHandle#state() polls the sources, and this
-        // is one of them. It is a straight infinite recursion. Everything needed is on the context.
-        final ForceState state = CentrifugalHandler.STATE;
+        final Player player = context.player();
+        final BodyFrame frame = frameOf(player);
 
-        final float deltaTicks = Math.min(Math.max(context.deltaTicks(), 0.0f), 4.0f);
-        final double dt = deltaTicks / 20.0;
-
-        final Vector3f raw = new Vector3f();
-
-        double response = CfConfig.CAMERA_RESPONSE.get();
-        double damping = CfConfig.CAMERA_DAMPING.get();
-
-        if (state.active) {
-            final Vector3d up = new Vector3d(state.bodyUp);
-
-            if (up.lengthSquared() < 1.0e-9 || !up.isFinite()) {
-                up.set(0.0, 1.0, 0.0);
-            }
-
-            up.normalize();
-
-            applyLean(up, state);
-
-            this.updateTurnRate(up, dt);
-
-            final double loopFactor = this.updateLoop(state, up, dt);
-
-            if (loopFactor > 1.0e-3) {
-                up.lerp(this.averageUp, loopFactor);
-
-                if (up.lengthSquared() < 1.0e-9) {
-                    up.set(0.0, 1.0, 0.0);
-                }
-
-                up.normalize();
-            }
-
-            final Vector3f target = new Vector3f((float) up.x, (float) up.y, (float) up.z);
-
-            final Vector3f deck = new Vector3f(
-                    (float) state.normal.x, (float) state.normal.y, (float) state.normal.z);
-
-            if (deck.lengthSquared() > 1.0e-9f) {
-                target.lerp(deck.normalize(), CfConfig.CAMERA_DECK_LEAN.get().floatValue());
-            }
-
-            if (target.lengthSquared() > 1.0e-9f) {
-                target.normalize();
-
-                // Shortest arc from world up to the target. Its axis is horizontal by
-                // construction, so there is no yaw in it to have to remove.
-                raw.set(CfMath.log(new Quaternionf().rotationTo(WORLD_UP, target)));
-                reproject(raw);
-
-                raw.mul(CfConfig.CAMERA_AMOUNT.get().floatValue());
-
-                CfMath.clampAngle(raw,
-                        (float) Math.toRadians(CfConfig.CAMERA_MAX_TILT_DEG.get()));
-            }
-
-            // A change of direction stiffens the spring; walking calms it. Independent and both
-            // bounded, so they cannot combine into something unstable.
-            response *= 1.0 + this.joltBoost(state);
-            response *= 1.0 - 0.4 * CfConfig.CAMERA_WALK_DAMPING.get() * this.updateWalk(state, dt);
-            damping *= 1.0 + CfConfig.CAMERA_WALK_DAMPING.get() * this.walkCharge;
-        } else {
-            this.decay(dt);
+        if (frame == null) {
+            return null;
         }
 
-        // Filter the target, not the camera. Filtering the output would make the camera late as
-        // well as smooth; filtering the goal lets the spring keep chasing hard, it just is not
-        // handed a jittering thing to chase.
-        final float blend = (float) CfConfig.smoothingAlpha(CfConfig.CAMERA_SMOOTHING.get(), dt);
+        final float dt = Math.max(1.0e-4f, Math.min(0.25f, context.deltaTicks() * (float) CfConfig.TICK));
 
-        this.smoothTarget.lerp(raw, Math.min(1.0f, Math.max(0.0f, blend)));
+        this.buildTarget(frame);
+        this.applyLead(dt);
+        this.updatePitchAxis(player, context.partialTick());
 
-        if (!this.smoothTarget.isFinite()) {
-            this.smoothTarget.zero();
-        }
-
-        this.applyDeadBand();
-
-        // deltaTicks() is ACS's realtime delta, so the spring is framerate independent - which is
-        // the whole reason it hands that out instead of partialTick.
-        return this.spring.step(
-                CfMath.exp(this.heldTarget), deltaTicks, (float) response, (float) damping);
+        return this.spring.advance(
+                this.leadTarget,
+                dt,
+                (float) CfConfig.CAMERA_RESPONSE.get(),
+                (float) CfConfig.CAMERA_DAMPING.get(),
+                (float) Math.toRadians(CfConfig.CAMERA_SLEW_DEG_PER_S.get()),
+                this.pitchAxis,
+                (float) CfConfig.clamp01(CfConfig.CAMERA_PITCH_RESPONSE.get()));
     }
 
     /**
-     * Leans the target towards felt gravity, by a fraction, capped in absolute degrees.
-     *
-     * <p>The cap is the whole point. A fraction of an unbounded angle is still unbounded, and the
-     * angle here reaches 60 or 70 degrees on a brisk turn - which is where "the camera heels over
-     * horribly on turns" came from. Capping in degrees leaves gentle changes scaled exactly as they
-     * were and saturates the violent ones.</p>
-     *
-     * <p>Coriolis is excluded because it is the only term produced by the player's own walking
-     * rather than by the ride, and leaving it in meant every step changed where down was.</p>
+     * The orientation the camera is aiming at: the committed plane, owned to the extent the player
+     * has earned it, plus a small honest lean towards where the forces actually point.
      */
-    private static void applyLean(final Vector3d up, final ForceState state) {
-        final double lean = CfConfig.CAMERA_LEAN.get();
-        final double cap = Math.toRadians(CfConfig.CAMERA_LEAN_MAX_DEG.get());
+    private void buildTarget(final BodyFrame frame) {
+        this.target.identity();
 
-        if (lean <= 0.0 || cap <= 0.0) {
+        final double stick = CfConfig.clamp01(frame.stick());
+
+        if (stick <= 0.0) {
             return;
         }
 
-        final Vector3d feltUp = new Vector3d(state.apparent).sub(state.coriolis).negate();
+        final Vector3dc normal = frame.planeNormal();
 
-        if (feltUp.lengthSquared() < 1.0e-9 || !feltUp.isFinite()) {
+        // Optional relief for players who do not want the full inversion at the top of a loop.
+        // Off by default: the request was to be able to do the loop, and turning the camera over is
+        // most of what makes hanging upside down read as hanging upside down.
+        final double inversion = CfConfig.clamp01(-normal.y());
+        final double suppression = 1.0 - CfConfig.CAMERA_LOOP_SUPPRESSION.get() * inversion;
+
+        final double amount = CfConfig.clamp01(
+                stick * CfConfig.CAMERA_AMOUNT.get() * Math.max(0.0, suppression));
+
+        if (amount > 0.0) {
+            final Quaterniondc plane = frame.plane().rotation();
+
+            this.scratch.set(
+                    (float) plane.x(), (float) plane.y(), (float) plane.z(), (float) plane.w())
+                    .normalize();
+
+            this.target.identity().slerp(this.scratch, (float) amount).normalize();
+        }
+
+        // A small extra lean towards felt-down. The plane is where you are standing; this is where
+        // the ride is actually pulling. Capped hard, because the whole point of committing to a
+        // plane was to stop the camera following a vector that moves every tick.
+        final Vector3dc apparent = frame.state().apparent;
+        final Vector3d feltUp = new Vector3d(apparent).negate();
+
+        if (feltUp.lengthSquared() < 1.0e-8 || !feltUp.isFinite()) {
             return;
         }
 
         feltUp.normalize();
 
-        final double dot = Math.min(1.0, Math.max(-1.0, up.dot(feltUp)));
-        final double angle = Math.acos(dot);
+        this.work.set((float) normal.x(), (float) normal.y(), (float) normal.z());
 
-        if (!(angle > 1.0e-4)) {
+        if (this.work.lengthSquared() < 1.0e-8) {
             return;
         }
 
-        final double wanted = Math.min(angle * lean, cap);
+        this.work.normalize();
 
-        up.lerp(feltUp, Math.min(1.0, wanted / angle));
+        final Vector3f felt = new Vector3f((float) feltUp.x, (float) feltUp.y, (float) feltUp.z);
 
-        if (up.lengthSquared() < 1.0e-9 || !up.isFinite()) {
-            up.set(0.0, 1.0, 0.0);
-        } else {
-            up.normalize();
+        final Vector3f lean = CfMath.log(this.scratch.rotationTo(this.work, felt));
+
+        lean.mul((float) (stick * CfConfig.CAMERA_LEAN.get()));
+
+        CfMath.clampAngle(lean, (float) Math.toRadians(CfConfig.CAMERA_LEAN_MAX_DEG.get()));
+
+        if (!lean.isFinite()) {
+            return;
         }
+
+        this.target.premul(CfMath.exp(lean)).normalize();
+
+        final Vector3f total = CfMath.log(this.target);
+
+        CfMath.clampAngle(total, (float) Math.toRadians(CfConfig.CAMERA_MAX_TILT_DEG.get()));
+
+        this.target.set(CfMath.exp(total));
     }
 
     /**
-     * Slop, not a threshold.
+     * Aims a fixed time ahead of where the target is going.
      *
-     * <p>Motion smaller than the dead band does not move the camera at all, which removes the
-     * micro-tremble. Past the dead band the target follows continuously, offset by the dead band -
-     * so there is no step, and therefore no stair-stepping, which is what a hard threshold would
-     * have traded the tremble for.</p>
+     * <p>A spring lags a moving target by roughly {@code 2 * zeta / omega} seconds, and that lag is
+     * predictable, so it can simply be subtracted. Doing it this way rather than by lowering the
+     * damping is the difference between a camera that keeps up and a camera that overshoots and
+     * comes back - both look "faster" in a still frame and only one of them is comfortable.</p>
      */
-    private void applyDeadBand() {
-        final float band = (float) Math.toRadians(CfConfig.CAMERA_DEADBAND_DEG.get());
+    private void applyLead(final float dt) {
+        final float lead = (float) CfConfig.CAMERA_LEAD.get();
 
-        if (band <= 0.0f) {
-            this.heldTarget.set(this.smoothTarget);
+        if (!this.primed || lead <= 0.0f) {
+            this.leadTarget.set(this.target);
+            this.lastTarget.set(this.target);
+            this.primed = true;
             return;
         }
 
-        final Vector3f error = new Vector3f(this.smoothTarget).sub(this.heldTarget);
-        final float magnitude = error.length();
+        final Quaternionf delta = new Quaternionf(this.lastTarget).conjugate().premul(this.target);
+        final Vector3f rate = CfMath.log(delta).div(dt);
 
-        if (magnitude <= band || !Float.isFinite(magnitude)) {
+        if (!rate.isFinite()) {
+            this.leadTarget.set(this.target);
+            this.lastTarget.set(this.target);
             return;
         }
 
-        this.heldTarget.add(error.mul((magnitude - band) / magnitude));
+        rate.mul(lead);
 
-        if (!this.heldTarget.isFinite()) {
-            this.heldTarget.zero();
-        }
+        CfMath.clampAngle(rate, MAX_LEAD);
+
+        this.leadTarget.set(this.target).premul(CfMath.exp(rate)).normalize();
+        this.lastTarget.set(this.target);
     }
 
-    /**
-     * How fast the target is swinging, rad/s, smoothed.
-     *
-     * <p>The honest measure of "the direction of the force is changing", which is what a rider feels
-     * as a change of direction. Zero for a steady spin however violent, and large for a genuine
-     * change however small the ride.</p>
-     */
-    private void updateTurnRate(final Vector3d up, final double dt) {
-        if (dt <= 0.0) {
+    /** The axis the player perceives as pitch: their own right, in world space. */
+    private void updatePitchAxis(final Player player, final float partialTick) {
+        final Vec3 view = player.getViewVector(partialTick);
+
+        this.pitchAxis.set((float) view.x, (float) view.y, (float) view.z).cross(WORLD_UP);
+
+        if (this.pitchAxis.lengthSquared() < 1.0e-6f) {
+            this.pitchAxis.set(1.0f, 0.0f, 0.0f);
             return;
         }
 
-        final double dot = Math.min(1.0, Math.max(-1.0, up.dot(this.previousUp)));
-        final double instant = Math.acos(dot) / dt;
-
-        this.previousUp.set(up);
-
-        if (!Double.isFinite(instant)) {
-            return;
-        }
-
-        // Smoothed, because one noisy frame should not spike the response the whole point of which
-        // is to be predictable.
-        final double blend = CfConfig.smoothingAlpha(0.09, dt);
-
-        this.turnRate += (instant - this.turnRate) * blend;
+        this.pitchAxis.normalize();
     }
 
-    /**
-     * How much of a loop we are in, 0..1, and maintains the running average of the target.
-     *
-     * <p>The average's window is tied to the revolution period rather than fixed. A fixed window
-     * either fails to cover a slow loop, in which case the average still swings and the camera
-     * still rolls, or over-smooths a fast one, in which case the camera stops responding to
-     * anything. Half a revolution is enough for the swinging part to cancel.</p>
-     */
-    private double updateLoop(final ForceState state, final Vector3d feltUp, final double dt) {
-        // Horizontal component only. Rotation about a vertical axis is a turn, and a turn should
-        // still lean; rotation about a horizontal axis is a flip, and that is what has to be
-        // suppressed. This one projection is the whole discriminator.
-        final double flipRate = Math.hypot(state.omega.x, state.omega.z);
-
-        final double period = flipRate > 1.0e-3 ? (2.0 * Math.PI / flipRate) : Double.MAX_VALUE;
-        final double halfLife = Math.min(2.0, Math.max(0.25, 0.5 * Math.min(period, 4.0)));
-
-        final double blend = CfConfig.smoothingAlpha(halfLife, dt);
-
-        this.averageUp.lerp(feltUp, Math.min(1.0, Math.max(0.0, blend)));
-
-        if (this.averageUp.lengthSquared() < 1.0e-6 || !this.averageUp.isFinite()) {
-            this.averageUp.set(0.0, 1.0, 0.0);
-        } else {
-            this.averageUp.normalize();
+    private static BodyFrame frameOf(final Player player) {
+        if (!(player instanceof BodyFrameHolder holder)) {
+            return null;
         }
 
-        final double target = CfConfig.smoothstep(flipRate, LOOP_RATE_LOW, LOOP_RATE_HIGH);
-
-        // Charged rather than applied instantly, so one quick flick is not mistaken for a loop.
-        final double chargeBlend = CfConfig.smoothingAlpha(0.3, dt);
-
-        this.loopCharge += (target - this.loopCharge) * Math.min(1.0, Math.max(0.0, chargeBlend));
-
-        return this.loopCharge * CfConfig.CAMERA_LOOP_SUPPRESSION.get();
-    }
-
-    /**
-     * How much the player is moving across the deck, 0..1, smoothed.
-     *
-     * <p>Reads the measured deck-relative velocity rather than {@code deltaMovement}, so being
-     * dragged across a drum counts as motion for the purpose of calming the camera, which is
-     * exactly when you want it calmed.</p>
-     */
-    private double updateWalk(final ForceState state, final double dt) {
-        final double speed = state.deckRelativeVelocity.length();
-        final double target = Math.min(1.0, speed / WALK_REFERENCE);
-
-        final double blend = CfConfig.smoothingAlpha(0.25, dt);
-
-        this.walkCharge += (target - this.walkCharge) * Math.min(1.0, Math.max(0.0, blend));
-
-        return this.walkCharge;
-    }
-
-    /**
-     * Extra stiffness from a change of direction.
-     *
-     * <p>Primarily the rate at which the target is swinging, with a smaller contribution from the
-     * sub-level's angular acceleration so a sharp flick registers even before the force has
-     * finished moving. Both are derivatives: large exactly when the ride changes what it is doing,
-     * zero when it is doing the same thing quickly - which is what "sharp" means.</p>
-     *
-     * <p>The curve is {@code x / (1 + x)}: monotonic, bounded by 1 and therefore by
-     * {@code jolt_gain}, with no knee to fall off. Predictable by construction rather than by
-     * tuning - twice the swing gives more response, always, and it cannot spike.</p>
-     */
-    private double joltBoost(final ForceState state) {
-        final double gain = CfConfig.CAMERA_JOLT_GAIN.get();
-
-        if (gain <= 0.0) {
-            return 0.0;
-        }
-
-        final double swing = this.turnRate / TURN_REFERENCE;
-        final double flick = state.angularAcceleration.length() / JOLT_REFERENCE;
-
-        final double x = swing + 0.5 * flick;
-
-        if (!Double.isFinite(x) || x <= 0.0) {
-            return 0.0;
-        }
-
-        return gain * (x / (1.0 + x));
-    }
-
-    private void decay(final double dt) {
-        final double blend = CfConfig.smoothingAlpha(0.4, dt);
-
-        this.loopCharge += (0.0 - this.loopCharge) * blend;
-        this.walkCharge += (0.0 - this.walkCharge) * blend;
-        this.turnRate += (0.0 - this.turnRate) * blend;
-        this.averageUp.lerp(new Vector3d(0.0, 1.0, 0.0), blend);
-        this.previousUp.set(0.0, 1.0, 0.0);
-
-        if (this.averageUp.lengthSquared() < 1.0e-6 || !this.averageUp.isFinite()) {
-            this.averageUp.set(0.0, 1.0, 0.0);
-        } else {
-            this.averageUp.normalize();
-        }
-    }
-
-    /**
-     * Rewrites the tilt in the player's own frame: full roll, damped pitch, no yaw.
-     *
-     * <p>Rotation vectors are what makes this a three-line operation - you can project and scale
-     * them componentwise, which is true of neither quaternions nor Euler angles.</p>
-     */
-    private static void reproject(final Vector3f rotation) {
-        final LocalPlayer player = Minecraft.getInstance().player;
-
-        if (player == null) {
-            return;
-        }
-
-        final float yaw = (float) Math.toRadians(player.getYRot());
-
-        // Minecraft yaw 0 looks along +Z.
-        final Vector3f forward = new Vector3f(-(float) Math.sin(yaw), 0.0f, (float) Math.cos(yaw));
-        final Vector3f right = new Vector3f(forward).cross(WORLD_UP);
-
-        if (right.lengthSquared() < 1.0e-9f) {
-            return;
-        }
-
-        right.normalize();
-
-        // Rotation about your forward axis is roll; about your right axis is pitch. Read both
-        // before overwriting.
-        final float roll = rotation.dot(forward);
-        final float pitch = rotation.dot(right) * CfConfig.CAMERA_PITCH_RESPONSE.get().floatValue();
-
-        rotation.set(forward).mul(roll).add(new Vector3f(right).mul(pitch));
+        return holder.sable_cf$bodyFrameOrNull();
     }
 }
