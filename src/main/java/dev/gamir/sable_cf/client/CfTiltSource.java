@@ -15,50 +15,60 @@ import org.joml.Vector3f;
 /**
  * Where the camera actually points.
  *
- * <h2>Felt gravity, not the deck plane</h2>
+ * <h2>The target is the body, not the force</h2>
  *
- * <p>Aligning the camera to the sub-level's plane is what makes a tilt feel like being glued to the
- * floor: the deck rolls 10 degrees, the view rolls 10 degrees, and your eyes conclude the world
- * moved rather than that you are standing on a slope. A real person on a listing deck keeps their
- * head near vertical, because the thing their balance tracks is gravity. So the target is apparent
- * gravity, and a gentle list, a banked turn and the inside of a fast drum all come out of that one
- * choice with no thresholds between them.</p>
+ * <p>This used to aim straight at felt gravity. That sounds right - balance tracks gravity - but it
+ * produces a camera that rolls the entire centrifugal angle on every bank while the body it belongs
+ * to stands bolt upright. A great deal of motion, none of it corresponding to anything the
+ * character is doing, and it heels hardest exactly when you are least pinned. That is the "why is
+ * it leaning so far" problem, and no amount of damping fixes it, because the target itself was
+ * wrong.</p>
+ *
+ * <p>So the target is the <b>body's</b> up direction, computed once in {@code BodyFrame} and shared
+ * with the hitbox. Three things follow, none of them tuned:</p>
+ *
+ * <ul>
+ *   <li>An ordinary deck - moving, accelerating, sloped, banking gently - rotates the body by
+ *       nothing, because the body tilt is gated on the ride's share of the press. So the camera
+ *       does nothing either.</li>
+ *   <li>A drum that genuinely pins you rotates body and camera together, so standing on the wall
+ *       looks like standing on the wall rather than like the world falling over.</li>
+ *   <li>The view and the hitbox cannot disagree, because there is one orientation and both read
+ *       it.</li>
+ * </ul>
+ *
+ * <p>A small, explicit lean towards felt gravity is added on top. With the body as the target that
+ * term is the only thing left that moves the view when you are not pinned, so it is what stops a
+ * change of direction from going numb - which is the other half of what was wanted.</p>
  *
  * <h2>Gentle, but not numb</h2>
  *
  * <p>Two separate problems, and conflating them is why this was hard to tune:</p>
  *
  * <ul>
- *   <li><b>Tremble.</b> Felt-down is reconstructed from a pose that arrives over the network, so it
- *       is never perfectly still, and a camera that tracks it faithfully never stops twitching.
- *       Fixed by filtering the <i>target</i> and applying a dead band to it - not by slowing the
- *       camera down, which would have cost the response as well.</li>
- *   <li><b>Response.</b> A change of direction has to be felt. Driven by how fast felt-down is
- *       swinging, which is precisely "the centrifugal direction is changing" - the thing you feel
- *       in your neck - rather than by the magnitude of the centrifugal vector. Magnitude is
- *       {@code omega^2 * r}: it grows with radius and with perfectly steady spin, so it reads large
- *       when nothing is happening and small for a genuine flick near the axis, which is exactly the
- *       "sometimes too much, sometimes nothing" instability.</li>
+ *   <li><b>Tremble.</b> The pose arrives over the network, so the target is never perfectly still,
+ *       and a camera that tracks it faithfully never stops twitching. Fixed by filtering the
+ *       <i>target</i> and applying a dead band to it - not by slowing the camera down, which would
+ *       have cost the response as well.</li>
+ *   <li><b>Response.</b> Driven by how fast the target is swinging, rather than by the magnitude of
+ *       the centrifugal vector. Magnitude is {@code omega^2 * r}: it grows with radius and with
+ *       perfectly steady spin, so it reads large when nothing is happening and small for a genuine
+ *       flick near the axis, which is exactly the "sometimes too much, sometimes nothing"
+ *       instability.</li>
  * </ul>
- *
- * <p>The dead band is applied as <i>slop</i>, not as a step: below it the camera does not move at
- * all, above it tracking is continuous with a constant offset. A hard threshold here would trade
- * tremble for stair-stepping, which is worse.</p>
  *
  * <h2>Three different signals, not one</h2>
  *
  * <ol>
- *   <li><b>A loop.</b> Felt-down sweeps a full circle, so a camera that follows it honestly rolls
- *       360 degrees - the single most nauseating thing a camera can do, and not what a human does
- *       either: you keep your head with your body and let the world go round you. Detected by the
- *       <i>horizontal</i> component of the sub-level's angular velocity, which is the useful
- *       discriminator - a banked turn yaws about a vertical axis and is left alone, while a flip or
- *       a loop rotates about a horizontal one. When detected, the target fades to a running average
- *       of felt-up whose window tracks the revolution period, and over a full revolution the
- *       centrifugal part of that average cancels and leaves real gravity.</li>
+ *   <li><b>A loop.</b> The body's up sweeps a full circle, so a camera that follows it honestly
+ *       rolls 360 degrees - the single most nauseating thing a camera can do, and not what a human
+ *       does either. Detected by the <i>horizontal</i> component of the sub-level's angular
+ *       velocity: a banked turn yaws about a vertical axis and is left alone, a flip rotates about
+ *       a horizontal one. When detected, the target fades to a running average whose window tracks
+ *       the revolution period.</li>
  *   <li><b>A sharp bank.</b> Should feel immediate. See {@link #joltBoost}.</li>
  *   <li><b>Walking about on a spinning deck.</b> Should feel like nothing at all. Handled by
- *       excluding Coriolis from the target and by damping the spring harder.</li>
+ *       excluding Coriolis and by damping the spring harder.</li>
  * </ol>
  */
 public final class CfTiltSource implements TiltSource {
@@ -66,7 +76,7 @@ public final class CfTiltSource implements TiltSource {
     private static final Vector3f WORLD_UP = new Vector3f(0.0f, 1.0f, 0.0f);
 
     /**
-     * Rate at which felt-down swings, rad/s, that counts as a decisive change of direction. Only
+     * Rate at which the target swings, rad/s, that counts as a decisive change of direction. Only
      * sets the scale of the response curve; the curve saturates, so this is not a threshold.
      */
     private static final double TURN_REFERENCE = 1.2;
@@ -80,21 +90,21 @@ public final class CfTiltSource implements TiltSource {
     /** Horizontal spin rate, rad/s, above which it is unambiguously a loop - a flip every 2.5 s. */
     private static final double LOOP_RATE_HIGH = 2.5;
 
-    /** Player speed, m/s, treated as "fully walking". Roughly a sprint. */
+    /** Speed across the deck, m/s, treated as "fully walking". Roughly a sprint. */
     private static final double WALK_REFERENCE = 4.3;
 
     private final TiltSpring spring = new TiltSpring();
 
-    /** Low-pass of felt-up. During a loop this is what the camera aims at instead. */
+    /** Low-pass of the target. During a loop this is what the camera aims at instead. */
     private final Vector3d averageUp = new Vector3d(0.0, 1.0, 0.0);
 
-    /** Felt-up last frame, for measuring how fast it is swinging. */
+    /** The target last frame, for measuring how fast it is swinging. */
     private final Vector3d previousUp = new Vector3d(0.0, 1.0, 0.0);
 
-    /** The filtered target, before the dead band. */
+    /** The filtered rotation, before the dead band. */
     private final Vector3f smoothTarget = new Vector3f();
 
-    /** The target the spring actually chases, after the dead band. */
+    /** The rotation the spring actually chases, after the dead band. */
     private final Vector3f heldTarget = new Vector3f();
 
     private double loopCharge;
@@ -134,52 +144,65 @@ public final class CfTiltSource implements TiltSource {
         double damping = CfConfig.CAMERA_DAMPING.get();
 
         if (state.active) {
-            // Coriolis is the only term produced by the player's own walking rather than by the
-            // ride. Leaving it in meant every step changed where "down" was, which is why simple
-            // walking on a turntable was nauseating even when nothing about the ride had changed.
-            final Vector3d deckApparent = new Vector3d(state.apparent).sub(state.coriolis);
+            final Vector3d up = new Vector3d(state.bodyUp);
 
-            final Vector3d up = new Vector3d(deckApparent).negate();
+            if (up.lengthSquared() < 1.0e-9 || !up.isFinite()) {
+                up.set(0.0, 1.0, 0.0);
+            }
 
-            if (up.lengthSquared() > 1.0e-9 && up.isFinite()) {
-                up.normalize();
+            up.normalize();
 
-                this.updateTurnRate(up, dt);
+            // The small deliberate lean towards felt gravity. Coriolis is excluded because it is
+            // the only term produced by the player's own walking rather than by the ride, and
+            // leaving it in meant every step changed where down was.
+            final Vector3d feltUp = new Vector3d(state.apparent).sub(state.coriolis).negate();
 
-                final double loopFactor = this.updateLoop(state, up, dt);
+            if (feltUp.lengthSquared() > 1.0e-9 && feltUp.isFinite()) {
+                feltUp.normalize();
+                up.lerp(feltUp, CfConfig.CAMERA_FELT_LEAN);
 
-                if (loopFactor > 1.0e-3) {
-                    up.lerp(this.averageUp, loopFactor);
-
-                    if (up.lengthSquared() < 1.0e-9) {
-                        up.set(0.0, 1.0, 0.0);
-                    }
-
+                if (up.lengthSquared() < 1.0e-9 || !up.isFinite()) {
+                    up.set(0.0, 1.0, 0.0);
+                } else {
                     up.normalize();
                 }
+            }
 
-                final Vector3f target = new Vector3f((float) up.x, (float) up.y, (float) up.z);
+            this.updateTurnRate(up, dt);
 
-                final Vector3f deck = new Vector3f(
-                        (float) state.normal.x, (float) state.normal.y, (float) state.normal.z);
+            final double loopFactor = this.updateLoop(state, up, dt);
 
-                if (deck.lengthSquared() > 1.0e-9f) {
-                    target.lerp(deck.normalize(), CfConfig.CAMERA_DECK_LEAN.get().floatValue());
+            if (loopFactor > 1.0e-3) {
+                up.lerp(this.averageUp, loopFactor);
+
+                if (up.lengthSquared() < 1.0e-9) {
+                    up.set(0.0, 1.0, 0.0);
                 }
 
-                if (target.lengthSquared() > 1.0e-9f) {
-                    target.normalize();
+                up.normalize();
+            }
 
-                    // Shortest arc from world up to felt up. Its axis is horizontal by
-                    // construction, so there is no yaw in it to have to remove.
-                    raw.set(CfMath.log(new Quaternionf().rotationTo(WORLD_UP, target)));
-                    reproject(raw);
+            final Vector3f target = new Vector3f((float) up.x, (float) up.y, (float) up.z);
 
-                    raw.mul(CfConfig.CAMERA_AMOUNT.get().floatValue());
+            final Vector3f deck = new Vector3f(
+                    (float) state.normal.x, (float) state.normal.y, (float) state.normal.z);
 
-                    CfMath.clampAngle(raw,
-                            (float) Math.toRadians(CfConfig.CAMERA_MAX_TILT_DEG.get()));
-                }
+            if (deck.lengthSquared() > 1.0e-9f) {
+                target.lerp(deck.normalize(), CfConfig.CAMERA_DECK_LEAN.get().floatValue());
+            }
+
+            if (target.lengthSquared() > 1.0e-9f) {
+                target.normalize();
+
+                // Shortest arc from world up to the target. Its axis is horizontal by
+                // construction, so there is no yaw in it to have to remove.
+                raw.set(CfMath.log(new Quaternionf().rotationTo(WORLD_UP, target)));
+                reproject(raw);
+
+                raw.mul(CfConfig.CAMERA_AMOUNT.get().floatValue());
+
+                CfMath.clampAngle(raw,
+                        (float) Math.toRadians(CfConfig.CAMERA_MAX_TILT_DEG.get()));
             }
 
             // A change of direction stiffens the spring; walking calms it. Independent and both
@@ -241,11 +264,11 @@ public final class CfTiltSource implements TiltSource {
     }
 
     /**
-     * How fast felt-up is swinging, rad/s, smoothed.
+     * How fast the target is swinging, rad/s, smoothed.
      *
-     * <p>This is the honest measure of "the direction of the force is changing", which is what a
-     * rider feels as a change of direction. It is zero for a steady spin however violent, and large
-     * for a genuine change however small the ride.</p>
+     * <p>The honest measure of "the direction of the force is changing", which is what a rider feels
+     * as a change of direction. Zero for a steady spin however violent, and large for a genuine
+     * change however small the ride.</p>
      */
     private void updateTurnRate(final Vector3d up, final double dt) {
         if (dt <= 0.0) {
@@ -269,10 +292,10 @@ public final class CfTiltSource implements TiltSource {
     }
 
     /**
-     * How much of a loop we are in, 0..1, and maintains the running average of felt-up.
+     * How much of a loop we are in, 0..1, and maintains the running average of the target.
      *
-     * <p>The average's window is tied to the revolution period rather than fixed. That matters:
-     * a fixed window either fails to cover a slow loop, in which case the average still swings and
+     * <p>The average's window is tied to the revolution period rather than fixed. That matters: a
+     * fixed window either fails to cover a slow loop, in which case the average still swings and
      * the camera still rolls, or over-smooths a fast one, in which case the camera stops responding
      * to anything. Half a revolution is enough for the swinging part to cancel.</p>
      */
@@ -306,13 +329,14 @@ public final class CfTiltSource implements TiltSource {
     }
 
     /**
-     * How much the player is moving under their own power, 0..1, smoothed.
+     * How much the player is moving across the deck, 0..1, smoothed.
      *
-     * <p>Smoothed because the raw value flickers every time you tap a key, and a spring whose
-     * damping flickers is worse than one that is slightly wrong.</p>
+     * <p>Reads the measured deck-relative velocity rather than {@code deltaMovement}, so being
+     * dragged across a drum counts as motion for the purpose of calming the camera, which is
+     * exactly when you want it calmed.</p>
      */
     private double updateWalk(final ForceState state, final double dt) {
-        final double speed = Math.hypot(state.relativeVelocity.x, state.relativeVelocity.z);
+        final double speed = state.deckRelativeVelocity.length();
         final double target = Math.min(1.0, speed / WALK_REFERENCE);
 
         final double blend = CfConfig.smoothingAlpha(0.25, dt);
@@ -325,7 +349,7 @@ public final class CfTiltSource implements TiltSource {
     /**
      * Extra stiffness from a change of direction.
      *
-     * <p>Primarily the rate at which felt-down is swinging, with a smaller contribution from the
+     * <p>Primarily the rate at which the target is swinging, with a smaller contribution from the
      * sub-level's angular acceleration so that a sharp flick of the controls registers even before
      * the force has finished moving. Both are derivatives: they are large exactly when the ride
      * changes what it is doing, and zero when it is doing the same thing quickly - which is what

@@ -24,7 +24,8 @@ public final class ForceState {
     /**
      * The deck's own acceleration at the player's position: centrifugal, Euler and any linear
      * acceleration of the whole contraption, all together, straight from Sable's velocity field.
-     * Filtered and dead-zoned, so a deck that is merely travelling reads exactly zero.
+     * Filtered in the sub-level's frame and dead-zoned, so a deck that is merely travelling reads
+     * exactly zero.
      */
     public final Vector3d frameAcceleration = new Vector3d();
 
@@ -53,7 +54,7 @@ public final class ForceState {
     /** The deliberate outward creep along the centrifugal direction. */
     public final Vector3d outwardSlip = new Vector3d();
 
-    /** Along-wall gravity cancellation while pinned - what lets you walk up a drum. */
+    /** Along-surface gravity cancellation while pressed - what lets you walk up a drum. */
     public final Vector3d climbAssist = new Vector3d();
 
     // ---------------------------------------------------------------- velocities, m/s
@@ -62,8 +63,8 @@ public final class ForceState {
      * Player velocity through the air the sub-level carries with it.
      *
      * <p>Not the world velocity. The deck's rigid translation is subtracted, so what is left is
-     * the rotation ({@code omega x r}) plus the player's own walking. A cruising platform is not a
-     * headwind for someone standing on it.</p>
+     * the rotation ({@code omega x r}) plus the player's own movement across the deck. A cruising
+     * platform is not a headwind for someone standing on it; a spinning drum is.</p>
      */
     public final Vector3d airVelocity = new Vector3d();
 
@@ -73,7 +74,16 @@ public final class ForceState {
     /** The rigid translation part of the above - the part that must never produce drag. */
     public final Vector3d deckTranslation = new Vector3d();
 
-    /** The player's velocity relative to the deck. Their own walking, essentially. */
+    /**
+     * The player's measured velocity across the deck.
+     *
+     * <p>From local position deltas, not from {@code deltaMovement}. Sable carries a standing
+     * player by moving their position, so {@code deltaMovement} cannot see a slide across the deck
+     * at all - which is how a speed-capped outward creep turned into an uncapped one.</p>
+     */
+    public final Vector3d deckRelativeVelocity = new Vector3d();
+
+    /** The player's own deltaMovement, scaled to m/s. Their walking effort. */
     public final Vector3d relativeVelocity = new Vector3d();
 
     /** How fast the player is sliding across the surface, m/s. */
@@ -90,13 +100,25 @@ public final class ForceState {
     /** Surface normal the player is standing on, world space, unit. */
     public final Vector3d normal = new Vector3d(0.0, 1.0, 0.0);
 
-    /** Normal of the wall the player is latched to, world space, unit. */
+    /** Normal of the surface the player is latched to, world space, unit. */
     public final Vector3d attachNormal = new Vector3d(0.0, 1.0, 0.0);
+
+    /**
+     * Which way is up for the body, world space, unit.
+     *
+     * <p>The camera's target. Publishing it here rather than letting the camera derive its own is
+     * what guarantees the view and the hitbox cannot disagree: there is one orientation, computed
+     * once, and both read it.</p>
+     */
+    public final Vector3d bodyUp = new Vector3d(0.0, 1.0, 0.0);
 
     // ---------------------------------------------------------------- scalars
 
     /** Normal load, m/s^2. Above one gravity you are being pressed harder than by gravity alone. */
     public double press;
+
+    /** The part of the press the ride is responsible for, m/s^2. */
+    public double ridePress;
 
     /** Tangential load trying to slide the player, m/s^2. */
     public double tangentialLoad;
@@ -112,7 +134,9 @@ public final class ForceState {
      *
      * <p>The number to read first when something feels wrong. Near zero on any ordinary deck
      * however it is moving; near one when a drum has you pinned. Everything that can tip or shove
-     * you is scaled by it.
+     * you is scaled by it. Note it is also near zero on the flat floor of a spinning drum, which
+     * is correct: the centrifugal vector is horizontal there, so it throws you outward without
+     * pressing you down at all.
      */
     public double frameShare;
 
@@ -134,7 +158,7 @@ public final class ForceState {
     /** Held on to a surface steeper than 60 degrees - the drum-wall case. */
     public boolean wallRide;
 
-    /** Deliberately latched to a wall by centrifugal press. */
+    /** Deliberately latched to a surface by centrifugal press. */
     public boolean attached;
 
     /** The deck stalled hard while we were attached, and we were thrown clear. */
@@ -154,13 +178,16 @@ public final class ForceState {
         this.airVelocity.zero();
         this.deckVelocity.zero();
         this.deckTranslation.zero();
+        this.deckRelativeVelocity.zero();
         this.relativeVelocity.zero();
         this.slip.zero();
         this.omega.zero();
         this.angularAcceleration.zero();
         this.normal.set(0.0, 1.0, 0.0);
         this.attachNormal.set(0.0, 1.0, 0.0);
+        this.bodyUp.set(0.0, 1.0, 0.0);
         this.press = 0.0;
+        this.ridePress = 0.0;
         this.tangentialLoad = 0.0;
         this.hold = 0.0;
         this.tilt = 0.0;

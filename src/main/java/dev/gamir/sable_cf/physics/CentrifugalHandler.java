@@ -17,28 +17,37 @@ import org.joml.Vector3dc;
  * <h2>What gets applied, and what deliberately does not</h2>
  *
  * <p>Only <b>fictitious</b> terms: the deck's frame acceleration, Coriolis, drag, and the two
- * deliberate gameplay pushes (outward slip, wall climb). Gravity is never applied here - vanilla
- * already does that. Getting this wrong doubles gravity, and it is the reason
- * {@code apparent} exists purely as a reported quantity rather than as something summed into the
- * player's velocity.</p>
+ * deliberate gameplay pushes (outward slip, surface climb). Gravity is never applied here - vanilla
+ * already does that. Getting this wrong doubles gravity, and it is the reason {@code apparent}
+ * exists purely as a reported quantity rather than as something summed into the player's
+ * velocity.</p>
  *
  * <p>The consequence worth stating plainly: on a sub-level that is merely travelling - a lift, a
  * ship under way, a drawbridge - every one of those terms is zero, so this handler adds exactly
  * nothing and movement is bit-for-bit vanilla. That is not a tuned threshold, it is what the terms
  * evaluate to.</p>
  *
+ * <h2>Velocity across the deck is measured, not inferred</h2>
+ *
+ * <p>Sable carries a standing player by moving their <i>position</i> through the pose, and never
+ * touches {@code deltaMovement}. So {@code deltaMovement} is blind to sliding across the deck: a
+ * player being dragged outward at three metres a second reports zero. Every speed limit here reads
+ * {@link BodyFrame#deckRelativeVelocity()} instead, which is differenced from the player's local
+ * position and therefore sees exactly what is happening. A limiter that cannot observe the quantity
+ * it limits is not a limiter, and that is precisely how a capped outward creep became an
+ * accelerating shove that pushed everyone off every spinning contraption.</p>
+ *
  * <h2>Drag is measured against the air the deck carries</h2>
  *
- * <p>The single most important line in this file subtracts the sub-level's rigid translation before
- * computing drag. Sable carries a standing player along with the deck, so their world velocity
- * includes the whole contraption's motion; feeding that to a drag law tells a player standing still
- * on a deck cruising at 25 m/s that they are in a 25 m/s gale, and then friction loses and they get
- * swept off a platform that is doing nothing unusual.</p>
+ * <p>The rigid translation is subtracted before computing drag. Feeding a player's world velocity
+ * to a drag law tells someone standing still on a deck cruising at 25 m/s that they are in a 25 m/s
+ * gale. What survives the subtraction is exactly what should: rotation does not move the pose's
+ * rotation centre, so {@code omega x r} is untouched and a spinner still tries to peel you off,
+ * while pure translation cancels to zero identically.</p>
  *
- * <p>What survives the subtraction is exactly what should. Rotation does not move the pose's
- * rotation centre, so {@code omega x r} is untouched and a spinner still tries to peel you off.
- * Walking is untouched, so running into the wind still costs you. Pure translation cancels to zero
- * identically, not approximately.</p>
+ * <p>That peeling is the intended purpose of drag in this mod. Wall riding should cost something,
+ * and being carried through still air at {@code omega x r} is what makes holding on a thing you do
+ * rather than a thing that happens.</p>
  *
  * <h2>One friction comparison, not three states</h2>
  *
@@ -99,8 +108,14 @@ public final class CentrifugalHandler {
         final Vector3d deck = new Vector3d(deckVec.x, deckVec.y, deckVec.z);
         final Vector3d translation = new Vector3d(frame.deckTranslation());
 
-        // The player's own motion. Sable carries a standing player, so deltaMovement is what they
-        // are doing on top of being carried - which is precisely "their own walking".
+        // Measured, not inferred. See the class note.
+        final Vector3d deckRelative = new Vector3d(frame.deckRelativeVelocity());
+
+        if (!deckRelative.isFinite()) {
+            deckRelative.zero();
+        }
+
+        // The player's walking effort, for Coriolis and for the overlay.
         final Vec3 ownVec = player.getDeltaMovement().scale(20.0);
         final Vector3d own = new Vector3d(ownVec.x, ownVec.y, ownVec.z);
 
@@ -111,7 +126,7 @@ public final class CentrifugalHandler {
         final Vec3 windVec = SableAccess.wind(player.level(), position);
 
         // deck - translation is exactly the rotational part, omega x r. See the class note.
-        final Vector3d air = new Vector3d(deck).sub(translation).add(own)
+        final Vector3d air = new Vector3d(deck).sub(translation).add(deckRelative)
                 .sub(windVec.x, windVec.y, windVec.z);
 
         if (!air.isFinite()) {
@@ -120,6 +135,7 @@ public final class CentrifugalHandler {
 
         STATE.deckVelocity.set(deck);
         STATE.deckTranslation.set(translation);
+        STATE.deckRelativeVelocity.set(deckRelative);
         STATE.relativeVelocity.set(own);
         STATE.airVelocity.set(air);
         STATE.omega.set(frame.omega());
@@ -128,11 +144,21 @@ public final class CentrifugalHandler {
         STATE.frameAcceleration.set(frame.frameAcceleration());
         STATE.apparent.set(frame.apparent());
         STATE.tilt = frame.tilt();
+        STATE.ridePress = frame.ridePress();
         STATE.frameShare = frame.frameShare();
         STATE.spinGate = frame.spinGate();
         STATE.contactCount = frame.contacts().count();
         STATE.attached = frame.isAttached();
         STATE.attachNormal.set(frame.attachNormal());
+
+        // The camera's target. Derived from the same orientation the hitbox uses, so the two
+        // cannot drift apart into "the view leans one way and the body is somewhere else".
+        STATE.bodyUp.set(0.0, 1.0, 0.0);
+        frame.orientation().transform(STATE.bodyUp);
+
+        if (!STATE.bodyUp.isFinite() || STATE.bodyUp.lengthSquared() < 1.0e-9) {
+            STATE.bodyUp.set(0.0, 1.0, 0.0);
+        }
 
         // ------------------------------------------------------------ the launch case
 
@@ -233,22 +259,20 @@ public final class CentrifugalHandler {
         // there and collision eats it, which is correct; if it points away it is what lifts you off.
         applied.add(normal.x * normalComponent, normal.y * normalComponent, normal.z * normalComponent);
 
-        if (tangentialLoad > 1.0e-9) {
-            if (tangentialLoad > hold) {
-                // One comparison, and the entire stand / slide / swept-off spectrum falls out of it.
-                final double excess = (tangentialLoad - hold) / tangentialLoad;
+        if (tangentialLoad > 1.0e-9 && tangentialLoad > hold) {
+            // One comparison, and the entire stand / slide / swept-off spectrum falls out of it.
+            final double excess = (tangentialLoad - hold) / tangentialLoad;
 
-                applied.add(tangential.x * excess, tangential.y * excess, tangential.z * excess);
+            applied.add(tangential.x * excess, tangential.y * excess, tangential.z * excess);
 
-                STATE.slipping = STATE.gripped;
-                STATE.slip.set(tangential).mul(excess / 20.0);
-            }
+            STATE.slipping = STATE.gripped;
+            STATE.slip.set(tangential).mul(excess / 20.0);
         }
 
         // ------------------------------------------------------------ deliberate pushes
 
-        applied.add(this.outwardSlip(frame, rideLoad, normal, own));
-        applied.add(this.wallClimb(frame, normal, press, own));
+        applied.add(this.outwardSlip(frame, rideLoad, normal, deckRelative));
+        applied.add(this.surfaceClimb(frame, normal, press, deckRelative));
         applied.add(this.adhesion(frame));
 
         // ------------------------------------------------------------ apply
@@ -286,10 +310,9 @@ public final class CentrifugalHandler {
     /**
      * Splits the ride load into a centrifugal part and everything else, for display only.
      *
-     * <p>Centrifugal is the component along the outward radial direction; Euler and any linear
-     * acceleration of the whole contraption are what is left. Nothing downstream of the debug
-     * overlay depends on this split being exact - the physics uses the total, which is the whole
-     * point of taking it from Sable's velocity field rather than assembling it by hand.</p>
+     * <p>Nothing downstream of the debug overlay depends on this split being exact - the physics
+     * uses the total, which is the whole point of taking it from Sable's velocity field rather than
+     * assembling it by hand.</p>
      */
     private void splitCentrifugal(
             final BodyFrame frame, final Vector3dc rideLoad, final double strength) {
@@ -322,14 +345,16 @@ public final class CentrifugalHandler {
      * Friction alone will not do it: friction is symmetric, so once it holds you it holds you
      * exactly where you are, and the ride never actually moves you anywhere.</p>
      *
-     * <p>So a fraction of the outward load is let past friction on purpose. It is capped as a
-     * <i>speed</i> rather than a force, which is what makes it a creep you can walk against rather
-     * than an accelerating slide into the wall - and it is rotation-gated, so nothing that is not
-     * spinning can nudge anybody.</p>
+     * <p>So a fraction of the outward load is let past friction on purpose - and then limited by
+     * <i>speed</i>, against the measured deck-relative velocity. That last detail is the whole
+     * difference between a drift and a disaster: the previous version asked {@code deltaMovement}
+     * how fast the creep was going, {@code deltaMovement} is structurally incapable of containing
+     * that motion, so the limiter always read zero and the push accumulated for as long as the ride
+     * turned. The fade means it settles at the cap rather than clipping at it.</p>
      */
     private Vector3d outwardSlip(
             final BodyFrame frame, final Vector3dc rideLoad,
-            final Vector3dc normal, final Vector3dc own) {
+            final Vector3dc normal, final Vector3dc deckRelative) {
 
         final Vector3d result = new Vector3d();
 
@@ -359,42 +384,63 @@ public final class CentrifugalHandler {
 
         outward.div(magnitude);
 
-        // Already drifting outward fast enough: stop pushing. A speed cap rather than a force cap
-        // is what keeps this a drift instead of a launch.
-        final double already = own.dot(outward);
+        final double limit = CfConfig.SLIP_MAX_SPEED.get();
 
-        if (already >= CfConfig.SLIP_MAX_SPEED.get()) {
+        if (!(limit > 0.0)) {
             return result;
         }
 
-        final double accel = magnitude * strength * gate;
+        // How much of the allowance is left. Fades to nothing at the cap, so the creep approaches
+        // a terminal drift instead of being cut off at one.
+        final double already = deckRelative.dot(outward);
+        final double room = Math.min(1.0, Math.max(0.0, (limit - already) / limit));
 
-        result.set(outward).mul(accel);
+        if (room <= 0.0) {
+            return result;
+        }
+
+        result.set(outward).mul(magnitude * strength * gate * room);
         STATE.outwardSlip.set(result);
 
         return result;
     }
 
     /**
-     * Walking up a wall you are pinned to.
+     * Walking up a surface the ride is pressing you into.
      *
-     * <p>This is the "wall riding" mechanic, and it is deliberately built out of press rather than
-     * out of tilt. A rider in a real rotor walks up the drum wall because centrifugal press gives
-     * their boots enough friction to beat gravity along the wall - not because the world rotated for
-     * them. So what this does is cancel a share of the along-wall gravity pull, in proportion to how
-     * hard the ride is pressing you into it. Below {@code full_press_g} nothing is cancelled and the
-     * wall is a wall; by {@code rim_climb_g} it is fully cancelled and the wall handles like a
-     * floor, so ordinary movement carries you up it and over a lip.</p>
+     * <p>This is the wall-riding mechanic, and it is deliberately built out of press rather than
+     * out of tilt or out of being latched. A rider in a real rotor walks up the drum wall because
+     * centrifugal press gives their boots enough friction to beat gravity along the wall - not
+     * because the world rotated for them, and not because they are glued on. So what this does is
+     * cancel a share of the along-surface gravity pull, in proportion to how hard the ride is
+     * pressing. Below {@code full_press_g} nothing is cancelled and a wall is a wall; by
+     * {@code rim_climb_g} it is fully cancelled and the surface handles like a floor, so ordinary
+     * movement carries you up it and over a lip.</p>
      *
-     * <p>Capped as a speed for the same reason as the slip: climbing should look like climbing, not
-     * like being fired out of the ride.</p>
+     * <p>Gated on the ride's <i>share</i> of the press rather than on the raw press, which is what
+     * keeps an ordinary floor - pressed at a full gravity by gravity - from becoming climbable. It
+     * is not gated on the surface being a wall by world up, so it works just as well on the ceiling
+     * at the top of a loop, which is exactly the ride this mod is for.</p>
      */
-    private Vector3d wallClimb(
-            final BodyFrame frame, final Vector3dc normal, final double press, final Vector3dc own) {
+    private Vector3d surfaceClimb(
+            final BodyFrame frame, final Vector3dc normal,
+            final double press, final Vector3dc deckRelative) {
 
         final Vector3d result = new Vector3d();
 
-        if (!CfConfig.SLIP_ENABLED.get() || !frame.isAttached()) {
+        if (!CfConfig.SLIP_ENABLED.get() || !frame.contacts().any()) {
+            return result;
+        }
+
+        final double gate = frame.spinGate();
+
+        if (gate <= 0.0) {
+            return result;
+        }
+
+        final double rideWeight = CfConfig.climbWeight(frame.frameShare());
+
+        if (rideWeight <= 1.0e-3) {
             return result;
         }
 
@@ -408,24 +454,24 @@ public final class CentrifugalHandler {
             return result;
         }
 
-        // Gravity's pull along the wall - the thing that stops you walking up it.
-        final Vector3d alongWall = new Vector3d(0.0, -gravity, 0.0);
-        final double intoWall = alongWall.dot(normal);
+        // Gravity's pull along the surface - the thing that stops you walking up it.
+        final Vector3d alongSurface = new Vector3d(0.0, -gravity, 0.0);
+        final double into = alongSurface.dot(normal);
 
-        alongWall.sub(normal.x() * intoWall, normal.y() * intoWall, normal.z() * intoWall);
+        alongSurface.sub(normal.x() * into, normal.y() * into, normal.z() * into);
 
-        if (alongWall.lengthSquared() < 1.0e-9) {
+        if (alongSurface.lengthSquared() < 1.0e-9) {
             return result;
         }
 
-        // Do not keep pushing once the player is already rising this fast along the wall.
-        final Vector3d up = new Vector3d(alongWall).negate().normalize();
+        // Do not keep helping once the player is already rising this fast along the surface.
+        final Vector3d up = new Vector3d(alongSurface).negate().normalize();
 
-        if (own.dot(up) >= CfConfig.RIM_CLIMB_SPEED.get()) {
+        if (deckRelative.dot(up) >= CfConfig.RIM_CLIMB_SPEED.get()) {
             return result;
         }
 
-        result.set(alongWall).mul(-share * frame.spinGate());
+        result.set(alongSurface).mul(-share * rideWeight * gate);
         STATE.climbAssist.set(result);
 
         return result;
@@ -464,10 +510,8 @@ public final class CentrifugalHandler {
      * were only ever attached to the deck, so the honest outcome is that you keep the velocity it
      * was giving you and continue - straight up, out through the middle.</p>
      *
-     * <p>Set rather than added, so this is a clean handover of the deck's motion instead of a
-     * bounce, and the player's own movement is preserved on top. {@link BodyFrame} only ever raises
-     * the flag for a player who was already latched, which is what keeps this from becoming
-     * "players ricochet off contraptions".</p>
+     * <p>{@link BodyFrame} only ever raises the flag for a player who was already latched, which is
+     * what keeps this from becoming "players ricochet off contraptions".</p>
      */
     private void launch(final LocalPlayer player, final BodyFrame frame) {
         final Vector3d velocity = new Vector3d(frame.releaseVelocity());
@@ -476,11 +520,12 @@ public final class CentrifugalHandler {
             return;
         }
 
-        final double cap = CfConfig.MAX_ACCEL_G.get() * CfConfig.GRAVITY;
         final double speed = velocity.length();
 
-        if (speed > cap && speed > 1.0e-9) {
-            velocity.mul(cap / speed);
+        // A speed rail, in m/s. The acceleration clamp is the wrong unit for this and was being
+        // used here by mistake, which made it no clamp at all.
+        if (speed > CfConfig.RELEASE_MAX_SPEED && speed > 1.0e-9) {
+            velocity.mul(CfConfig.RELEASE_MAX_SPEED / speed);
         }
 
         final Vec3 own = player.getDeltaMovement();
