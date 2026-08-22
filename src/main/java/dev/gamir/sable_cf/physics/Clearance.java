@@ -18,17 +18,18 @@ import org.joml.Vector3d;
 /**
  * "Would the body fit if it leaned like this?"
  *
- * <h2>Why a lean has to be asked permission for</h2>
+ * <h2>What the pivot actually does, and why it had to be fixed rather than worked around</h2>
  *
- * <p>Sable rotates the collision box about the player's <b>eye</b>, not their feet:</p>
+ * <p>Sable rotates the collision box about the player's <b>eye</b>:</p>
  *
- * <pre>offset = (0, eyeHeight - ysize/2, 0)
+ * <pre>offset = (0, eyeHeight - ysize/2, 0)      // 0.72 for a standing player
  *centre += offset - R * offset</pre>
  *
- * <p>So a lean of A degrees sweeps the feet sideways by {@code 2 * 1.62 * sin(A/2)} blocks - 0.28
- * at 10 degrees, 0.97 at 35, 2.3 at 90. Pivoting at the feet would swing the head <i>away</i> from
- * a wall you are leaning towards and cost nothing; pivoting at the eye drives the feet straight
- * into it.</p>
+ * <p>The box centre therefore sweeps {@code 2 * 0.72 * sin(A/2)} blocks for a lean of A, and the
+ * <i>feet</i> - the corner the player cares about - sweep further still, because the feet sit
+ * another 0.9 below the centre. Rotating a body about a point 1.62 up is not a lean, it is a
+ * cartwheel: the feet leave the surface they are standing on and go through the wall behind
+ * them.</p>
  *
  * <p>What happens next is not a gentle correction. Sable runs eight substeps, resolves up to four
  * penetrations in each, and its near-vertical branch redirects the entire minimum translation
@@ -36,14 +37,24 @@ import org.joml.Vector3d;
  *
  * <pre>if (dot &gt; 0.8) { entityUp.mul(maxMTV.dot(entityUp), maxMTV).normalize(preLength); }</pre>
  *
- * <p>A metre of penetration therefore comes back as a metre-long shove pointing up and out of the
- * wall. That is the whole mechanism behind "I leaned a little and it spat me through the wall", and
- * it is geometry rather than tuning - no combination of strengths avoids it.</p>
+ * <p>A metre of penetration comes back as a metre-long shove pointing up and out of the wall. That
+ * is the reported "it starts lifting me up and shaking", and it is geometry, not tuning - no
+ * combination of strengths avoids it, because the penetration is created before any force is
+ * consulted.</p>
  *
- * <p>Since the pivot cannot be moved from outside Sable, the lean is asked in advance instead. The
- * body is only allowed to reach a posture it actually fits in, so the violent resolution never has
- * anything to resolve. Upstream ask #2 in {@code docs/UPSTREAM.md} is a feet pivot, and this file
- * deletes cleanly the day that lands.</p>
+ * <p>So the pivot is no longer worked around: {@code SubLevelEntityCollisionMixin} cancels it, and
+ * the box rotates about its own centre. A centred rotation of a 0.6 x 1.8 x 0.6 box sweeps at most
+ * {@code (1.8 - 0.6) / 2 = 0.6} of a block at 90 degrees, and sweeps <b>nothing at all</b> over a
+ * full turn - after 360 degrees the box is exactly where it started, which is what makes the
+ * "solnyshko" loop safe to follow all the way round.</p>
+ *
+ * <h2>Why this class still exists</h2>
+ *
+ * <p>0.6 of a block is small but it is not zero, and the swept volume is still real: leaning
+ * towards a wall you are already brushing can put a shoulder inside it. This asks first, and the
+ * body is only allowed to reach a posture it fits in, so the violent resolution above never has
+ * anything to resolve. It tests the same box Sable will - including the pivot Sable will actually
+ * use, which is why it reads the same config flag the mixin does.</p>
  *
  * <h2>The sample set</h2>
  *
@@ -98,15 +109,17 @@ public final class Clearance {
         final double halfWidth = Math.max(0.02, width * 0.5 - CfConfig.CLEARANCE_SHRINK);
         final double halfHeight = Math.max(0.02, height * 0.5 - CfConfig.CLEARANCE_SHRINK);
 
-        // Sable's pivot, reproduced exactly. Testing a box built any other way would be testing a
-        // box Sable is not going to collide.
-        final Vector3d offset = new Vector3d(0.0, entity.getEyeHeight() - height * 0.5, 0.0);
-        final Vector3d rotatedOffset = orientation.transform(new Vector3d(offset));
-
         final Vector3d centre = new Vector3d(
-                entity.getX(), entity.getY() + height * 0.5, entity.getZ())
-                .add(offset)
-                .sub(rotatedOffset);
+                entity.getX(), entity.getY() + height * 0.5, entity.getZ());
+
+        if (!CfConfig.HITBOX_CENTRE_PIVOT.get()) {
+            // The mixin is off, or did not apply. Reproduce Sable's eye pivot exactly - testing a
+            // box built any other way would be testing a box Sable is not going to collide.
+            final Vector3d offset = new Vector3d(0.0, entity.getEyeHeight() - height * 0.5, 0.0);
+            final Vector3d rotatedOffset = orientation.transform(new Vector3d(offset));
+
+            centre.add(offset).sub(rotatedOffset);
+        }
 
         final Vector3d axisX = orientation.transform(new Vector3d(halfWidth, 0.0, 0.0));
         final Vector3d axisY = orientation.transform(new Vector3d(0.0, halfHeight, 0.0));

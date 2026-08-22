@@ -3,202 +3,180 @@ package dev.gamir.sable_cf.physics;
 import org.joml.Vector3d;
 
 /**
- * Last tick's numbers, for the camera, the arrows and {@code /sable_cf status}.
+ * A readable snapshot of one tick of physics: what was measured, what was decided, what was
+ * applied.
  *
- * <p>Deliberately a mutable bag of vectors that is reused rather than reallocated: it is written
- * once per tick and read several times per frame by the renderer, and allocating a fresh object
- * per tick to be read at 200 fps is the wrong trade.</p>
- *
- * <p>The reason it exists at all is that the camera must not recompute any of this. If it did,
- * there would be two implementations of the same physics running at different rates, and they
- * would disagree - which is precisely the class of bug where the camera leans one way and the
- * player slides the other.</p>
+ * <p>Mutable and reused rather than allocated, because it is refilled every tick for every player
+ * and read by the overlay every frame. Nothing here feeds back into the simulation - if a field
+ * were load-bearing it would live on {@link BodyFrame} instead. That separation is deliberate: it
+ * means the debug overlay can be as detailed as it likes without any risk of the act of observing
+ * changing the result.</p>
  */
 public final class ForceState {
 
-    /** True when the player is on a sub-level and the numbers below mean something. */
+    // ------------------------------------------------------------------ what is going on
+
+    /** True when the player is on a sub-level and the mod has something to say about it. */
     public boolean active;
 
-    // ---------------------------------------------------------------- accelerations, m/s^2
-
-    /**
-     * The deck's own acceleration at the player's position: centrifugal, Euler and any linear
-     * acceleration of the whole contraption, all together, straight from Sable's velocity field.
-     * Filtered in the sub-level's frame and dead-zoned, so a deck that is merely travelling reads
-     * exactly zero.
-     */
-    public final Vector3d frameAcceleration = new Vector3d();
-
-    /** Centrifugal part of the above, separated for display only. */
-    public final Vector3d centrifugal = new Vector3d();
-
-    /** Everything in the frame acceleration that is not centrifugal: Euler plus linear. */
-    public final Vector3d euler = new Vector3d();
-
-    /**
-     * Coriolis, {@code -2 omega x v_rel}. Kept separate from everything else on purpose: it is the
-     * only term driven by the player's own walking rather than by the ride, which makes it the term
-     * the camera has to ignore. Mixing it in is what made ordinary walking on a turntable nauseous.
-     */
-    public final Vector3d coriolis = new Vector3d();
-
-    /** Air drag. */
-    public final Vector3d drag = new Vector3d();
-
-    /** Gravity plus every fictitious term: what the player's inner ear would report. */
-    public final Vector3d apparent = new Vector3d();
-
-    /** What was actually added to the player's velocity, after friction and clamping. */
-    public final Vector3d applied = new Vector3d();
-
-    /** The deliberate outward creep along the centrifugal direction. */
-    public final Vector3d outwardSlip = new Vector3d();
-
-    /** Along-surface gravity cancellation while pressed - what lets you walk up a drum. */
-    public final Vector3d climbAssist = new Vector3d();
-
-    // ---------------------------------------------------------------- velocities, m/s
-
-    /**
-     * Player velocity through the air the sub-level carries with it.
-     *
-     * <p>Not the world velocity. The deck's rigid translation is subtracted, so what is left is
-     * the rotation ({@code omega x r}) plus the player's own movement across the deck. A cruising
-     * platform is not a headwind for someone standing on it; a spinning drum is.</p>
-     */
-    public final Vector3d airVelocity = new Vector3d();
-
-    /** The deck's world velocity at the player's position: translation plus omega x r. */
-    public final Vector3d deckVelocity = new Vector3d();
-
-    /** The rigid translation part of the above - the part that must never produce drag. */
-    public final Vector3d deckTranslation = new Vector3d();
-
-    /**
-     * The player's measured velocity across the deck.
-     *
-     * <p>From local position deltas, not from {@code deltaMovement}. Sable carries a standing
-     * player by moving their position, so {@code deltaMovement} cannot see a slide across the deck
-     * at all - which is how a speed-capped outward creep turned into an uncapped one.</p>
-     */
-    public final Vector3d deckRelativeVelocity = new Vector3d();
-
-    /** The player's own deltaMovement, scaled to m/s. Their walking effort. */
-    public final Vector3d relativeVelocity = new Vector3d();
-
-    /** How fast the player is sliding across the surface, m/s. */
-    public final Vector3d slip = new Vector3d();
-
-    // ---------------------------------------------------------------- frame
-
-    /** Sub-level angular velocity, rad/s. */
-    public final Vector3d omega = new Vector3d();
-
-    /** Sub-level angular acceleration, rad/s^2. What a sharp manoeuvre actually looks like. */
-    public final Vector3d angularAcceleration = new Vector3d();
-
-    /** Surface normal the player is standing on, world space, unit. */
-    public final Vector3d normal = new Vector3d(0.0, 1.0, 0.0);
-
-    /** Normal of the surface the player is latched to, world space, unit. */
-    public final Vector3d attachNormal = new Vector3d(0.0, 1.0, 0.0);
-
-    /**
-     * Which way is up for the body, world space, unit.
-     *
-     * <p>The camera's target. Publishing it here rather than letting the camera derive its own is
-     * what guarantees the view and the hitbox cannot disagree: there is one orientation, computed
-     * once, and both read it.</p>
-     */
-    public final Vector3d bodyUp = new Vector3d(0.0, 1.0, 0.0);
-
-    // ---------------------------------------------------------------- scalars
-
-    /** Normal load, m/s^2. Above one gravity you are being pressed harder than by gravity alone. */
-    public double press;
-
-    /** The part of the press the ride is responsible for, m/s^2. */
-    public double ridePress;
-
-    /** Tangential load trying to slide the player, m/s^2. */
-    public double tangentialLoad;
-
-    /** Most the feet can hold, m/s^2. Sliding starts when the load exceeds this. */
-    public double hold;
-
-    /** How far the body has rotated towards the surface, 0..1. */
-    public double tilt;
-
-    /**
-     * Fraction of the normal load the ride is supplying rather than gravity, 0..1.
-     *
-     * <p>The number to read first when something feels wrong. Near zero on any ordinary deck
-     * however it is moving; near one when a drum has you pinned. Everything that can tip or shove
-     * you is scaled by it. Note it is also near zero on the flat floor of a spinning drum, which
-     * is correct: the centrifugal vector is horizontal there, so it throws you outward without
-     * pressing you down at all.
-     */
-    public double frameShare;
-
-    /** How much of the rotation-specific behaviour is active, 0..1. Zero unless actually spinning. */
-    public double spinGate;
-
-    /** How many of the six body faces are in contact. Zero means airborne. */
-    public int contactCount;
-
-    /** Pressed hard enough into a surface for it to count as footing. */
-    public boolean gripped;
-
-    /** Gripped, but the load has beaten friction and the player is sliding. */
-    public boolean slipping;
-
-    /** Sneaking, so friction is boosted. */
-    public boolean bracing;
-
-    /** Held on to a surface steeper than 60 degrees - the drum-wall case. */
-    public boolean wallRide;
-
-    /** Deliberately latched to a surface by centrifugal press. */
-    public boolean attached;
-
-    /** The deck stalled hard while we were attached, and we were thrown clear. */
+    /** True on the ticks where a sudden loss of ride is being smoothed out. */
     public boolean released;
 
+    /** How many of the six body faces are touching sub-level geometry. */
+    public int contactCount;
+
+    // ------------------------------------------------------------------ the frame
+
+    /** Angular velocity of the sub-level, world space, rad/s. Lead compensated. */
+    public final Vector3d omega = new Vector3d();
+
+    /** Angular acceleration of the sub-level, world space, rad/s^2. */
+    public final Vector3d angularAcceleration = new Vector3d();
+
+    /** 0..1 ramp on how much the sub-level counts as "spinning". */
+    public double spinGate;
+
+    /** Velocity of the deck material under the player, m/s. */
+    public final Vector3d deckVelocity = new Vector3d();
+
+    /** Rigid translation of the contraption, m/s. */
+    public final Vector3d deckTranslation = new Vector3d();
+
+    /** Player velocity minus deck velocity, m/s. What sliding is measured in. */
+    public final Vector3d relativeVelocity = new Vector3d();
+
+    // ------------------------------------------------------------------ accelerations, m/s^2
+
+    /** Centrifugal: outward, the felt half of {@code omega x (omega x r)}. */
+    public final Vector3d centrifugal = new Vector3d();
+
+    /** Euler: the felt half of {@code alpha x r}. Spin-up and spin-down. */
+    public final Vector3d euler = new Vector3d();
+
+    /** Coriolis: {@code -2 omega x v_rel}. Only nonzero while moving across the deck. */
+    public final Vector3d coriolis = new Vector3d();
+
+    /** Felt acceleration from the contraption translating as a whole. Heavily dead-zoned. */
+    public final Vector3d linear = new Vector3d();
+
+    /** Air resistance, m/s^2. The one thing allowed to unstick you. */
+    public final Vector3d drag = new Vector3d();
+
+    /** Everything felt in the rotating frame, gravity included. */
+    public final Vector3d apparent = new Vector3d();
+
+    /** What was actually added to the player's velocity this tick, as an acceleration. */
+    public final Vector3d applied = new Vector3d();
+
+    // ------------------------------------------------------------------ air
+
+    /** Player velocity relative to the air, m/s. */
+    public final Vector3d airVelocity = new Vector3d();
+
+    public double airSpeed;
+
+    // ------------------------------------------------------------------ the floor
+
+    /** World unit normal of the committed plane. World up when there is none. */
+    public final Vector3d normal = new Vector3d(0.0, 1.0, 0.0);
+
+    /** Committed face index, or {@link GravityPlane#NONE}. */
+    public int planeIndex = GravityPlane.NONE;
+
+    /** Face currently arguing for a switch, or {@link GravityPlane#NONE}. */
+    public int challengerIndex = GravityPlane.NONE;
+
+    /** How many consecutive ticks the challenger has been winning by the margin. */
+    public int challengerTicks;
+
+    // ------------------------------------------------------------------ wall walking
+
+    /** Total press into the plane including gravity, m/s^2. Negative means being pulled off. */
+    public double press;
+
+    /** Press from the ride alone, gravity excluded, m/s^2. This is what earns the stick. */
+    public double ridePress;
+
+    /** 0..1. How much of a wall-walker the player currently is. The headline number. */
+    public double stick;
+
+    /** 0..1 ramp on how much grip the remaining contact is worth. */
+    public double footing;
+
+    /** Tangential load the friction solve had to deal with, m/s^2. */
+    public double tangentialLoad;
+
+    /** How much of it friction actually held, m/s^2. */
+    public double hold;
+
+    /** Acceleration that friction could not hold, m/s^2. This is the slide. */
+    public final Vector3d slip = new Vector3d();
+
+    public boolean gripped;
+
+    public boolean slipping;
+
+    /** True while the player is actively holding a movement key into the surface. */
+    public boolean bracing;
+
+    /** True once the player is more on a wall than on a floor. */
+    public boolean wallRide;
+
+    // ------------------------------------------------------------------ the body
+
+    /** Angle of the smoothed body orientation away from upright, degrees. */
+    public double bodyAngleDeg;
+
+    /** Angle of the orientation actually handed to Sable's collision, degrees. */
+    public double hitboxAngleDeg;
+
+    /** True on ticks where the hitbox was held back because the posture would not fit. */
+    public boolean clearanceBlocked;
+
+    /** Resets everything to "nothing is happening". */
     public void clear() {
         this.active = false;
-        this.frameAcceleration.zero();
+        this.released = false;
+        this.contactCount = 0;
+
+        this.omega.zero();
+        this.angularAcceleration.zero();
+        this.spinGate = 0.0;
+        this.deckVelocity.zero();
+        this.deckTranslation.zero();
+        this.relativeVelocity.zero();
+
         this.centrifugal.zero();
         this.euler.zero();
         this.coriolis.zero();
+        this.linear.zero();
         this.drag.zero();
         this.apparent.zero();
         this.applied.zero();
-        this.outwardSlip.zero();
-        this.climbAssist.zero();
+
         this.airVelocity.zero();
-        this.deckVelocity.zero();
-        this.deckTranslation.zero();
-        this.deckRelativeVelocity.zero();
-        this.relativeVelocity.zero();
-        this.slip.zero();
-        this.omega.zero();
-        this.angularAcceleration.zero();
+        this.airSpeed = 0.0;
+
         this.normal.set(0.0, 1.0, 0.0);
-        this.attachNormal.set(0.0, 1.0, 0.0);
-        this.bodyUp.set(0.0, 1.0, 0.0);
+        this.planeIndex = GravityPlane.NONE;
+        this.challengerIndex = GravityPlane.NONE;
+        this.challengerTicks = 0;
+
         this.press = 0.0;
         this.ridePress = 0.0;
+        this.stick = 0.0;
+        this.footing = 0.0;
         this.tangentialLoad = 0.0;
         this.hold = 0.0;
-        this.tilt = 0.0;
-        this.frameShare = 0.0;
-        this.spinGate = 0.0;
-        this.contactCount = 0;
+        this.slip.zero();
+
         this.gripped = false;
         this.slipping = false;
         this.bracing = false;
         this.wallRide = false;
-        this.attached = false;
-        this.released = false;
+
+        this.bodyAngleDeg = 0.0;
+        this.hitboxAngleDeg = 0.0;
+        this.clearanceBlocked = false;
     }
 }
