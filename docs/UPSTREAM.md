@@ -1,6 +1,6 @@
 # Upstream requests
 
-Five requests, each with the code path that forced it. Written to be pasted into an issue.
+Seven requests, each with the code path that forced it. Written to be pasted into an issue.
 
 One request from the earlier version of this document has been **withdrawn** - see the end.
 
@@ -32,7 +32,58 @@ is the only reason a mixin is needed here at all.
 
 ---
 
-## 2. Sable: public read access to the contact manifold
+## 2. Sable: make the collision-box rotation pivot configurable
+
+**Where:** `sublevel/entity_collision/SubLevelEntityCollision.transformEntityBoundsCenter`.
+
+```java
+final Vector3d offset = sink.anchorRelativePosition.set(
+        0.0, entity.getEyeHeight() - entity.getBoundingBox().getYsize() / 2.0, 0.0);
+center.add(offset).sub(customOrientation.transform(offset));
+```
+
+The oriented box is rotated about a point at eye height rather than about its own centre. For the
+small tilts this was written for that is a reasonable choice - the head stays put and the feet swing
+a little. For large angles it is not: with `offset = 0.72` for a standing player, the box centre
+sweeps `2 * 0.72 * sin(A/2)`, which is 0.13 blocks at 10 degrees, **1.02 at 90** and 1.44 at 180.
+
+The box is therefore translated bodily into whatever surface it is leaning towards, and the
+penetration that creates is real. Resolution then hits this branch:
+
+```java
+if (dot > 0.8) { entityUp.mul(maxMTV.dot(entityUp), maxMTV).normalize(preLength); }
+```
+
+which redirects the entire MTV along the body up axis at full length - so a metre of self-inflicted
+penetration returns as a metre-long shove up and outward, up to four times per substep and eight
+substeps per tick for a local player. The visible result is an entity that lifts and vibrates as
+soon as it tilts more than a little, and it is produced entirely inside Sable, before any consumer
+force is applied.
+
+There is a second consequence that matters for rides: over a full 360-degree rotation the eye pivot
+integrates to a **non-zero net displacement**, so an entity carried once around a loop does not
+return to where it started relative to the deck. About its own centre, it does - exactly.
+
+**Ask:** a pivot choice on the orientation provider, or simply a boolean, defaulting to today's
+behaviour:
+
+```java
+enum OrientationPivot { EYE, BOUNDS_CENTRE }
+```
+
+A consumer that rotates entities to 90 degrees or beyond needs `BOUNDS_CENTRE`; one that leans them
+slightly is better off with `EYE`. Sable already knows both points.
+
+This mod currently ships a mixin that cancels the method outright when the orientation is its own,
+which is sound only because the pivot has exactly one use inside collision: the
+`fma(+eyeHeight, up_old)` / `fma(-eyeHeight, up_new)` pair in the substep loop cancels for a
+consumer that returns one orientation per tick, and `getFeetPos` is only ever consumed as a
+difference under the same rotation. It is nonetheless a mixin over an internal method, and it is
+the only remaining one that could break on a Sable point release.
+
+---
+
+## 3. Sable: public read access to the contact manifold
 
 **Where:** `sable$getCollisionInfo()` is `@ApiStatus.Internal`.
 
@@ -51,7 +102,7 @@ depth, and which sub-level).
 
 ---
 
-## 3. Sable: public angular velocity of a sub-level on the client
+## 4. Sable: public angular velocity of a sub-level on the client
 
 The field exists and is private. External code is left differentiating successive poses, which is
 noisy exactly where it matters most - the moment a ride changes rate - and forces a low-pass filter
@@ -63,7 +114,7 @@ consumer's finite difference.
 
 ---
 
-## 4. Sable: offset the eye position along the entity's body up-vector
+## 5. Sable: offset the eye position along the entity's body up-vector
 
 With a rotated collision box, the eye is still placed at `position + eyeHeight * worldUp`. Lying
 against the wall of a spinning drum, that puts the camera slightly inside the body.
@@ -78,7 +129,7 @@ correction rather than cooperate with it.
 
 ---
 
-## 5. Sure Footing: a release hook
+## 6. Sure Footing: a release hook
 
 Sure Footing keeps a player in the sub-level frame across a jump arc, which is the correct behaviour
 and the reason this mod does not touch that part of the problem at all.
@@ -93,7 +144,7 @@ carry for a tick without racing it.
 
 ---
 
-## 6. ACS: release `addTiltSource`
+## 7. ACS: release `addTiltSource`
 
 `AcsHandle#addTiltSource(int, TiltSource)` exists on the `api-beta` line. Released 1.3.7 exposes only
 `addListener` and `addPolicy`, and neither can set tilt - a listener observes it and a policy affects
