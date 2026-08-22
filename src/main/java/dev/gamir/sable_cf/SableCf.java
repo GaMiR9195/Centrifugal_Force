@@ -1,58 +1,49 @@
 package dev.gamir.sable_cf;
 
+import dev.gamir.sable_cf.client.ClientSetup;
+import dev.gamir.sable_cf.command.CfCommands;
+import dev.gamir.sable_cf.physics.BodyFrameTicker;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.IEventBus;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.fml.config.ModConfig;
 import net.neoforged.fml.loading.FMLEnvironment;
+import net.neoforged.neoforge.common.NeoForge;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Sable: Centrifugal Force.
+ * Entry point.
  *
- * <p>Three things, all for the local player, all on the client:</p>
+ * <p>Three registrations, and the split between them is the whole architecture:</p>
+ *
  * <ul>
- *   <li><b>Rotating-frame forces.</b> The centrifugal, Euler and Coriolis acceleration of the
- *       sub-level you are tracking are added to your own velocity. Spin a drum fast enough and
- *       the outward push beats gravity, which is the whole reason a real rotor ride lets you
- *       stand on its wall.</li>
- *   <li><b>Air drag against static friction.</b> Drag is computed from your speed <i>through the
- *       air</i> - on a spinner that is mostly the deck's own tangential speed - and is then
- *       compared against what friction can hold. Under the limit you stand; over it you slide,
- *       slowly or fast; far over it you leave.</li>
- *   <li><b>A camera that follows felt gravity.</b> Not the deck plane. On a gentle list felt
- *       gravity is still almost straight down, so the camera barely moves; in a drum the
- *       centrifugal term dominates and it rolls all the way over. Driven through Aeronautics
- *       Camera Sync's {@code TiltSource} extension point.</li>
+ *   <li>The config is <b>COMMON</b>, not client. It gates the rotated hitbox, and a hitbox only one
+ *       side believes in is worse than no hitbox change at all - the server keeps testing an
+ *       upright box, finds the player inside blocks, and shoves them out. Common config, common
+ *       code, same answer on both sides.</li>
+ *   <li>{@link BodyFrameTicker} runs on <b>both</b> sides. It recomputes body orientation from
+ *       Sable's pose, which both sides already have, so the two agree without a single packet.</li>
+ *   <li>Only the camera and the debug arrows are client-side, because only they are actually about
+ *       what you see.</li>
  * </ul>
- *
- * <h2>No mixins</h2>
- *
- * <p>Deliberately. Sable is reached through {@code Sable.HELPER} plus two of its duck interfaces,
- * and every one of those calls lives in {@code compat/SableAccess} so there is exactly one file to
- * look at when Sable moves. ACS is reached only through its published {@code api} package. Sure
- * Footing is not called at all - it already keeps you in the sub-level's frame through a jump arc,
- * which is the inherited-inertia half of the job, so we leave it alone and do not duplicate it.</p>
- *
- * <p>The three things that would be better as upstream API than as anything we can do from here
- * are written up in {@code docs/UPSTREAM.md}.</p>
  */
 @Mod(SableCf.MOD_ID)
 public final class SableCf {
 
     public static final String MOD_ID = "sable_cf";
 
-    public static final Logger LOGGER = LoggerFactory.getLogger("Sable: Centrifugal Force");
+    public static final Logger LOGGER = LoggerFactory.getLogger("sable_cf");
 
-    public SableCf(final ModContainer container) {
-        container.registerConfig(ModConfig.Type.CLIENT, CfConfig.SPEC);
+    public SableCf(final IEventBus modBus, final ModContainer container) {
+        container.registerConfig(ModConfig.Type.COMMON, CfConfig.SPEC);
 
-        // Client only, and not just for the camera. Players are client-authoritative for movement:
-        // the server adopts the position out of the movement packets, so writing velocity here is
-        // the side that actually decides where you end up. Doing it server-side as well would have
-        // the two fighting each other - this is the same split Sure Footing settled on.
-        if (FMLEnvironment.dist.isClient()) {
-            dev.gamir.sable_cf.client.ClientSetup.init(container);
+        NeoForge.EVENT_BUS.register(new BodyFrameTicker());
+        NeoForge.EVENT_BUS.addListener(CfCommands::onRegisterCommands);
+
+        if (FMLEnvironment.dist == Dist.CLIENT) {
+            ClientSetup.init(modBus);
         }
     }
 }

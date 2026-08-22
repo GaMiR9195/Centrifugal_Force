@@ -8,69 +8,117 @@ import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
+import org.jetbrains.annotations.Nullable;
 import org.joml.Vector3d;
+import org.joml.Vector3dc;
 
 /**
- * Every single line of Sable this mod touches. One file on purpose.
+ * Everything this mod needs from Sable, in one place.
  *
- * <p>Two of these calls go through {@code dev.ryanhcode.sable.mixinterface}, which is
- * {@code @ApiStatus.Internal} - Sable makes no promise about it across versions. That is exactly
- * why the runtime dependency is pinned to {@code [2.0.0,2.1)} rather than open-ended, and exactly
- * why they are all in here: when Sable moves, this is the only file to read. Sure Footing pins
- * itself for the same reason and against the same interfaces.</p>
- *
- * <p>Everything else is {@code Sable.HELPER}, which is public and does the interesting work.</p>
+ * <p>Sable's movement state lives behind {@code @ApiStatus.Internal} duck interfaces, and the
+ * velocity helper is only reachable through a static. Funnelling all of it through here means the
+ * physics code reads as physics, and the day Sable renames something exactly one file breaks. Every
+ * method is null-safe and returns a neutral value off a sub-level, because "is this player on a
+ * contraption" is a question the callers ask constantly and should not have to guard.</p>
  */
 public final class SableAccess {
 
-    /** The sub-level the entity is standing on or locked to, or null. */
+    /** The sub-level this entity is currently standing on, or null. */
+    @Nullable
     public static SubLevel tracking(final Entity entity) {
-        return Sable.HELPER.getTrackingSubLevel(entity);
+        if (entity instanceof EntityMovementExtension extension) {
+            return extension.sable$getTrackingSubLevel();
+        }
+
+        return null;
+    }
+
+    public static void setTracking(final Entity entity, @Nullable final SubLevel subLevel) {
+        if (entity instanceof EntityMovementExtension extension) {
+            extension.sable$setTrackingSubLevel(subLevel);
+        }
     }
 
     /**
-     * Writes the tracking sub-level. Internal duck interface, and the only write this mod makes
-     * into Sable's own state - see {@code CfConfig.RELEASE_TRACKING} for why it is off by default.
+     * Velocity the entity has inherited from the sub-level, m/s. This is what Sure Footing
+     * preserves across a jump, so it is also what has to be excluded from "the player's own
+     * movement".
      */
-    public static void setTracking(final Entity entity, final SubLevel subLevel) {
-        ((EntityMovementExtension) entity).sable$setTrackingSubLevel(subLevel);
+    public static Vec3 inheritedVelocity(final Entity entity) {
+        if (entity instanceof LivingEntity && entity instanceof LivingEntityMovementExtension extension) {
+            final Vector3d inherited = new Vector3d(extension.sable$getInheritedVelocity());
+
+            if (inherited.isFinite()) {
+                return new Vec3(inherited.x, inherited.y, inherited.z);
+            }
+        }
+
+        return Vec3.ZERO;
     }
 
     /**
-     * The velocity Sable hands an entity when it stops carrying it, m/s. Read-only, and only used
-     * for the debug readout - it is the number that answers "did Sable already give me the deck's
-     * momentum, or do I need to?", and the answer is that it did.
-     */
-    public static Vector3d inheritedVelocity(final LivingEntity entity) {
-        return ((LivingEntityMovementExtension) entity).sable$getInheritedVelocity();
-    }
-
-    /**
-     * World-space velocity of the point of the sub-level currently under a world position, in m/s.
+     * World velocity, m/s, of the sub-level material at a <b>world</b> position.
      *
-     * <p>Sable wants the position in sub-level local space and returns the global velocity, so the
-     * inverse transform is part of the call. On the client this resolves to a pose difference times
-     * 20; on the server it comes off the rigid body. Either way it already includes both the spin
-     * and the linear drift of the contraption, which is why this mod never has to guess at either.</p>
+     * <p>Exact: Sable computes it from the pose delta, so it already includes rotation about the
+     * true rotation point, the sub-level's scale, and any linear drift. Deriving the same thing by
+     * hand from omega and a guessed centre is how you end up with forces that are right on a
+     * turntable and wrong on anything that also moves.</p>
      */
-    public static Vec3 pointVelocity(final SubLevel subLevel, final Vec3 worldPos) {
-        final Vec3 local = subLevel.logicalPose().transformPositionInverse(worldPos);
-        return Sable.HELPER.getVelocity(subLevel.getLevel(), subLevel, local);
+    public static Vec3 pointVelocity(final SubLevel subLevel, final Vec3 worldPosition) {
+        final Level level = subLevel.getLevel();
+
+        if (level == null) {
+            return Vec3.ZERO;
+        }
+
+        final Vec3 local = subLevel.logicalPose().transformPositionInverse(worldPosition);
+
+        return sanitise(Sable.HELPER.getVelocity(level, subLevel, local));
     }
 
     /**
-     * Wind at a world position, m/s, including whatever Aeronautics and friends registered as wind
-     * providers.
+     * World velocity, m/s, of the sub-level material at a <b>local</b> position.
      *
-     * <p>There is no {@code getWind} in Sable, but there does not need to be:
-     * {@code getVelocityRelativeToAir} is defined as {@code getVelocity - wind}, so subtracting the
-     * two recovers the wind itself. It works outside a sub-level plot as well, where
-     * {@code getVelocity} is zero and the relative value is just {@code -wind} - which is the case
-     * that matters, since a player on a contraption in the overworld is at overworld coordinates.</p>
+     * <p>The local overload is the one that matters for acceleration. A local point is a fixed
+     * piece of the contraption, so sampling the same local point on two ticks and differencing
+     * gives the material acceleration of the deck. Doing the same with a world point would mix in
+     * the deck sliding past that point in space and give a meaningless number.</p>
      */
-    public static Vec3 wind(final Level level, final Vec3 worldPos) {
-        return Sable.HELPER.getVelocity(level, worldPos)
-                .subtract(Sable.HELPER.getVelocityRelativeToAir(level, worldPos));
+    public static Vec3 localPointVelocity(final SubLevel subLevel, final Vector3dc localPosition) {
+        final Level level = subLevel.getLevel();
+
+        if (level == null || !localPosition.isFinite()) {
+            return Vec3.ZERO;
+        }
+
+        final Vec3 local = new Vec3(localPosition.x(), localPosition.y(), localPosition.z());
+
+        return sanitise(Sable.HELPER.getVelocity(level, subLevel, local));
+    }
+
+    /**
+     * Wind at a world position, m/s.
+     *
+     * <p>Sable exposes absolute velocity and velocity-relative-to-air but not the air itself, so
+     * the difference of the two is the wind. Needed because drag has to act on the player's speed
+     * through the air, not through the world - inside a moving airship's hull the air moves with
+     * the ship and there should be no drag at all.</p>
+     */
+    public static Vec3 wind(final Level level, final Vec3 position) {
+        final Vec3 absolute = Sable.HELPER.getVelocity(level, position);
+        final Vec3 relative = Sable.HELPER.getVelocityRelativeToAir(level, position);
+
+        return sanitise(absolute.subtract(relative));
+    }
+
+    private static Vec3 sanitise(@Nullable final Vec3 value) {
+        if (value == null
+                || Double.isNaN(value.x) || Double.isNaN(value.y) || Double.isNaN(value.z)
+                || Double.isInfinite(value.x) || Double.isInfinite(value.y) || Double.isInfinite(value.z)) {
+            return Vec3.ZERO;
+        }
+
+        return value;
     }
 
     private SableAccess() {

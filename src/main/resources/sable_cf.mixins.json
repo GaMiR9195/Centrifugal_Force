@@ -1,0 +1,13 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "dev.gamir.sable_cf.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EntityMixin",
+    "EntitySubLevelUtilMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
