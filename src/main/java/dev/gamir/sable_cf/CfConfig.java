@@ -325,7 +325,8 @@ public final class CfConfig {
 
         GRIP_FULL_PRESS_G = b
                 .comment("Press, in g, at which the body is fully aligned with the surface - standing on",
-                        "a wall as if it were the floor. Top of the partial-tilt ramp.",
+                        "a wall as if it were the floor. Top of the partial-tilt ramp, and the bottom of",
+                        "the climb ramp.",
                         "1.0 rather than something dramatic: a washing-machine ride is not going to spin",
                         "at 4 g, and an effect you cannot reach is not a feature. Note the tilt is ALSO",
                         "scaled by the ride share, so an ordinary floor pressing you at 1 g does not",
@@ -391,13 +392,18 @@ public final class CfConfig {
                 .defineInRange("max_speed", 2.2, 0.1, 20.0);
 
         RIM_CLIMB_G = b
-                .comment("Centrifugal press, in g, at which you can walk up the surface you are pinned to.",
+                .comment("Centrifugal press, in g, at which you can fully walk up the surface you are",
+                        "pinned to. The climb ramps from full_press_g to here.",
                         "Explicitly NOT driven by the tilt of the physics: what happens is that the",
                         "along-surface pull of gravity is progressively cancelled, in proportion to how",
                         "hard the RIDE is pressing you in. A rider in a real rotor walks up the wall for",
                         "exactly that reason - press gives their boots the friction to beat gravity.",
-                        "Below full_press_g nothing is cancelled and a wall is a wall.")
-                .defineInRange("rim_climb_g", 1.05, 0.2, 16.0);
+                        "Below full_press_g nothing is cancelled and a wall is a wall.",
+                        "1.6 leaves a 0.6 g ramp above full_press_g, and the width is the point: press on",
+                        "a real drum wanders by a few m/s^2 from tick to tick, so a narrow band would be",
+                        "a switch with noise on it and the assist would snap on and off several times a",
+                        "second instead of easing you onto the wall.")
+                .defineInRange("rim_climb_g", 1.6, 0.2, 16.0);
 
         RIM_CLIMB_SPEED = b
                 .comment("How fast the climb may carry you along the surface, m/s. Kept near walking pace",
