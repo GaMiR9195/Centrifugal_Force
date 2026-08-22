@@ -54,6 +54,8 @@ public final class CfCommands {
     private static final ChatFormatting DANGER = ChatFormatting.RED;
     private static final ChatFormatting UNIT = ChatFormatting.DARK_GRAY;
 
+    private static final String[] FACES = {"+Y", "-Y", "+X", "-X", "+Z", "-Z"};
+
     public static void onRegisterCommands(final RegisterCommandsEvent event) {
         event.getDispatcher().register(build());
     }
@@ -84,6 +86,10 @@ public final class CfCommands {
                 // No strength: it either fires on a hard stall or it does not. A number here would
                 // only invite tuning something that should be a rare, decisive event.
                 .then(toggle("release", CfConfig.RELEASE_ENABLED))
+                // Off means never commit to a face: the body stays upright and only the
+                // forces act. Kept as a switch because it is the one change that alters
+                // what the mod fundamentally is.
+                .then(toggle("plane", CfConfig.PLANE_ENABLED))
                 .then(Commands.literal("reset")
                         .requires(source -> source.hasPermission(2))
                         .executes(CfCommands::reset));
@@ -177,6 +183,7 @@ public final class CfCommands {
     private static int reset(final CommandContext<CommandSourceStack> context) {
         restore(CfConfig.CENTRIFUGAL_ENABLED);
         restore(CfConfig.CENTRIFUGAL_STRENGTH);
+        restore(CfConfig.CENTRIFUGAL_LEAD);
         restore(CfConfig.CORIOLIS_STRENGTH);
         restore(CfConfig.MAX_ACCEL_G);
 
@@ -190,16 +197,21 @@ public final class CfCommands {
         restore(CfConfig.GRIP_BRACE_BONUS);
         restore(CfConfig.GRIP_MIN_PRESS_G);
         restore(CfConfig.GRIP_FULL_PRESS_G);
+        restore(CfConfig.GRIP_SLIDE_DAMPING);
         restore(CfConfig.GRIP_SLIDE_CAP_G);
-        restore(CfConfig.ATTACH_PRESS_G);
-        restore(CfConfig.ATTACH_RELEASE_G);
-        restore(CfConfig.ATTACH_SHARE);
-        restore(CfConfig.ATTACH_ADHESION_G);
 
         restore(CfConfig.WALL_ENABLED);
         restore(CfConfig.WALL_STRENGTH);
-        restore(CfConfig.WALL_PRESS_G);
+        restore(CfConfig.WALL_MIN_PRESS_G);
+        restore(CfConfig.WALL_FULL_PRESS_G);
+        restore(CfConfig.WALL_LOOP_ASSIST);
         restore(CfConfig.WALL_MAX_SPEED);
+
+        restore(CfConfig.PLANE_ENABLED);
+        restore(CfConfig.PLANE_SWITCH_MARGIN_G);
+        restore(CfConfig.PLANE_DWELL_TICKS);
+        restore(CfConfig.PLANE_HALF_LIFE);
+        restore(CfConfig.PLANE_SLEW_DEG_PER_S);
 
         restore(CfConfig.RELEASE_ENABLED);
         restore(CfConfig.RELEASE_DECEL_G);
@@ -208,20 +220,19 @@ public final class CfCommands {
         restore(CfConfig.HITBOX_ENABLED);
         restore(CfConfig.HITBOX_AMOUNT);
         restore(CfConfig.HITBOX_MAX_DEG);
+        restore(CfConfig.HITBOX_CENTRE_PIVOT);
+        restore(CfConfig.HITBOX_HALF_LIFE);
+        restore(CfConfig.HITBOX_SLEW_DEG_PER_S);
 
         restore(CfConfig.CAMERA_ENABLED);
         restore(CfConfig.CAMERA_AMOUNT);
-        restore(CfConfig.CAMERA_LEAN);
-        restore(CfConfig.CAMERA_LEAN_MAX_DEG);
         restore(CfConfig.CAMERA_RESPONSE);
         restore(CfConfig.CAMERA_DAMPING);
-        restore(CfConfig.CAMERA_SMOOTHING);
-        restore(CfConfig.CAMERA_DEADBAND_DEG);
-        restore(CfConfig.CAMERA_JOLT_GAIN);
-        restore(CfConfig.CAMERA_LOOP_SUPPRESSION);
-        restore(CfConfig.CAMERA_WALK_DAMPING);
+        restore(CfConfig.CAMERA_LEAD);
+        restore(CfConfig.CAMERA_LEAN);
+        restore(CfConfig.CAMERA_LEAN_MAX_DEG);
         restore(CfConfig.CAMERA_PITCH_RESPONSE);
-        restore(CfConfig.CAMERA_DECK_LEAN);
+        restore(CfConfig.CAMERA_LOOP_SUPPRESSION);
         restore(CfConfig.CAMERA_MAX_TILT_DEG);
         restore(CfConfig.CAMERA_SLEW_DEG_PER_S);
 
@@ -238,7 +249,7 @@ public final class CfCommands {
     // ---------------------------------------------------------------- status
 
     private static int status(final CommandContext<CommandSourceStack> context) {
-        final ForceState state = CentrifugalHandler.STATE;
+        final ForceState state = CentrifugalHandler.lastState();
 
         final MutableComponent header = Component.literal("Sable CF ")
                 .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD)
@@ -281,13 +292,16 @@ public final class CfCommands {
         // ride is acting on you, so nothing it does should be visible - if you are being moved
         // anyway, it is not this mod.
         reply(context, join(
-                label("ride share").append(number(state.frameShare,
-                        state.frameShare > 0.5 ? WARN : ChatFormatting.WHITE)),
+                label("stick").append(number(state.stick,
+                        state.stick > 0.5 ? ChatFormatting.LIGHT_PURPLE : ChatFormatting.WHITE)),
+                label("footing").append(number(state.footing,
+                        state.footing > 0.0 ? ChatFormatting.WHITE : OFF)),
                 label("contacts").append(count(state.contactCount,
                         state.contactCount > 0 ? ChatFormatting.WHITE : OFF)),
-                label("attached").append(state.attached
-                        ? Component.literal("wall").withStyle(ChatFormatting.LIGHT_PURPLE)
-                        : Component.literal("no").withStyle(OFF))));
+                label("plane").append(state.planeIndex >= 0
+                        ? Component.literal(FACES[state.planeIndex])
+                                .withStyle(ChatFormatting.LIGHT_PURPLE)
+                        : Component.literal("none").withStyle(OFF))));
 
         final MutableComponent footing = state.gripped
                 ? (state.slipping
@@ -302,7 +316,10 @@ public final class CfCommands {
         reply(context, join(
                 label("footing").append(footing).append(third),
                 label("brace").append(onOff(state.bracing)),
-                label("tilt").append(number(state.tilt, state.tilt > 0.5 ? WARN : ChatFormatting.WHITE))));
+                label("body").append(number(state.bodyAngleDeg, ChatFormatting.WHITE))
+                        .append(unit(" deg")),
+                label("hitbox").append(number(state.hitboxAngleDeg,
+                        state.clearanceBlocked ? WARN : ChatFormatting.WHITE)).append(unit(" deg"))));
 
         final double spin = state.omega.length();
         final double jolt = state.angularAcceleration.length();
@@ -319,7 +336,7 @@ public final class CfCommands {
         // reads near zero, and that is the fix for being swept off one - if it reads high while you
         // are standing still, the deck is spinning, not merely moving.
         reply(context, join(
-                label("air").append(number(state.airVelocity.length(), ChatFormatting.WHITE))
+                label("air").append(number(state.airSpeed, ChatFormatting.WHITE))
                         .append(unit(" m/s")),
                 label("deck").append(number(state.deckVelocity.length(), ChatFormatting.WHITE))
                         .append(unit(" m/s")),
