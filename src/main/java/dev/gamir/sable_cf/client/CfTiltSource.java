@@ -24,10 +24,28 @@ import org.joml.Vector3f;
  * gravity, and a gentle list, a banked turn and the inside of a fast drum all come out of that one
  * choice with no thresholds between them.</p>
  *
- * <h2>Three different signals, not one</h2>
+ * <h2>Gentle, but not numb</h2>
  *
- * <p>Felt gravity alone is not enough, because three situations that produce a similar vector want
- * completely different camera behaviour, and treating them as one is what made this nauseating:</p>
+ * <p>Two separate problems, and conflating them is why this was hard to tune:</p>
+ *
+ * <ul>
+ *   <li><b>Tremble.</b> Felt-down is reconstructed from a pose that arrives over the network, so it
+ *       is never perfectly still, and a camera that tracks it faithfully never stops twitching.
+ *       Fixed by filtering the <i>target</i> and applying a dead band to it - not by slowing the
+ *       camera down, which would have cost the response as well.</li>
+ *   <li><b>Response.</b> A change of direction has to be felt. Driven by how fast felt-down is
+ *       swinging, which is precisely "the centrifugal direction is changing" - the thing you feel
+ *       in your neck - rather than by the magnitude of the centrifugal vector. Magnitude is
+ *       {@code omega^2 * r}: it grows with radius and with perfectly steady spin, so it reads large
+ *       when nothing is happening and small for a genuine flick near the axis, which is exactly the
+ *       "sometimes too much, sometimes nothing" instability.</li>
+ * </ul>
+ *
+ * <p>The dead band is applied as <i>slop</i>, not as a step: below it the camera does not move at
+ * all, above it tracking is continuous with a constant offset. A hard threshold here would trade
+ * tremble for stair-stepping, which is worse.</p>
+ *
+ * <h2>Three different signals, not one</h2>
  *
  * <ol>
  *   <li><b>A loop.</b> Felt-down sweeps a full circle, so a camera that follows it honestly rolls
@@ -38,10 +56,9 @@ import org.joml.Vector3f;
  *       a loop rotates about a horizontal one. When detected, the target fades to a running average
  *       of felt-up whose window tracks the revolution period, and over a full revolution the
  *       centrifugal part of that average cancels and leaves real gravity.</li>
- *   <li><b>A sharp bank.</b> Should feel immediate. Driven by angular <i>acceleration</i>, not by
- *       the size of the centrifugal vector - see {@link #joltBoost}.</li>
+ *   <li><b>A sharp bank.</b> Should feel immediate. See {@link #joltBoost}.</li>
  *   <li><b>Walking about on a spinning deck.</b> Should feel like nothing at all. Handled by
- *       excluding Coriolis from the target and by damping the spring harder, below.</li>
+ *       excluding Coriolis from the target and by damping the spring harder.</li>
  * </ol>
  */
 public final class CfTiltSource implements TiltSource {
@@ -49,10 +66,13 @@ public final class CfTiltSource implements TiltSource {
     private static final Vector3f WORLD_UP = new Vector3f(0.0f, 1.0f, 0.0f);
 
     /**
-     * Angular acceleration, rad/s^2, that counts as a decisive flick of the controls. Only sets
-     * the scale of the response curve; the curve saturates, so this is not a threshold.
+     * Rate at which felt-down swings, rad/s, that counts as a decisive change of direction. Only
+     * sets the scale of the response curve; the curve saturates, so this is not a threshold.
      */
-    private static final double JOLT_REFERENCE = 6.0;
+    private static final double TURN_REFERENCE = 1.2;
+
+    /** Angular acceleration, rad/s^2, that counts as a decisive flick of the controls. */
+    private static final double JOLT_REFERENCE = 8.0;
 
     /** Horizontal spin rate, rad/s, below which nothing is a loop - about one turn per seven seconds. */
     private static final double LOOP_RATE_LOW = 0.9;
@@ -68,8 +88,18 @@ public final class CfTiltSource implements TiltSource {
     /** Low-pass of felt-up. During a loop this is what the camera aims at instead. */
     private final Vector3d averageUp = new Vector3d(0.0, 1.0, 0.0);
 
+    /** Felt-up last frame, for measuring how fast it is swinging. */
+    private final Vector3d previousUp = new Vector3d(0.0, 1.0, 0.0);
+
+    /** The filtered target, before the dead band. */
+    private final Vector3f smoothTarget = new Vector3f();
+
+    /** The target the spring actually chases, after the dead band. */
+    private final Vector3f heldTarget = new Vector3f();
+
     private double loopCharge;
     private double walkCharge;
+    private double turnRate;
 
     @Override
     public boolean appliesTo(final TiltContext context) {
@@ -98,7 +128,7 @@ public final class CfTiltSource implements TiltSource {
         final float deltaTicks = Math.min(Math.max(context.deltaTicks(), 0.0f), 4.0f);
         final double dt = deltaTicks / 20.0;
 
-        final Vector3f rotation = new Vector3f();
+        final Vector3f raw = new Vector3f();
 
         double response = CfConfig.CAMERA_RESPONSE.get();
         double damping = CfConfig.CAMERA_DAMPING.get();
@@ -113,6 +143,8 @@ public final class CfTiltSource implements TiltSource {
 
             if (up.lengthSquared() > 1.0e-9 && up.isFinite()) {
                 up.normalize();
+
+                this.updateTurnRate(up, dt);
 
                 final double loopFactor = this.updateLoop(state, up, dt);
 
@@ -140,29 +172,100 @@ public final class CfTiltSource implements TiltSource {
 
                     // Shortest arc from world up to felt up. Its axis is horizontal by
                     // construction, so there is no yaw in it to have to remove.
-                    rotation.set(CfMath.log(new Quaternionf().rotationTo(WORLD_UP, target)));
-                    reproject(rotation);
+                    raw.set(CfMath.log(new Quaternionf().rotationTo(WORLD_UP, target)));
+                    reproject(raw);
 
-                    rotation.mul(CfConfig.CAMERA_AMOUNT.get().floatValue());
+                    raw.mul(CfConfig.CAMERA_AMOUNT.get().floatValue());
 
-                    CfMath.clampAngle(rotation,
+                    CfMath.clampAngle(raw,
                             (float) Math.toRadians(CfConfig.CAMERA_MAX_TILT_DEG.get()));
                 }
             }
 
-            // A sharp manoeuvre stiffens the spring; walking calms it. Independent and both bounded,
-            // so they cannot combine into something unstable.
-            response *= 1.0 + joltBoost(state);
+            // A change of direction stiffens the spring; walking calms it. Independent and both
+            // bounded, so they cannot combine into something unstable.
+            response *= 1.0 + this.joltBoost(state);
             response *= 1.0 - 0.4 * CfConfig.CAMERA_WALK_DAMPING.get() * this.updateWalk(state, dt);
             damping *= 1.0 + CfConfig.CAMERA_WALK_DAMPING.get() * this.walkCharge;
         } else {
             this.decay(dt);
         }
 
+        // Filter the target, not the camera. Filtering the output would make the camera late as
+        // well as smooth; filtering the goal lets the spring keep chasing hard, it just is not
+        // handed a jittering thing to chase.
+        final float blend = (float) CfConfig.smoothingAlpha(CfConfig.CAMERA_SMOOTHING.get(), dt);
+
+        this.smoothTarget.lerp(raw, Math.min(1.0f, Math.max(0.0f, blend)));
+
+        if (!this.smoothTarget.isFinite()) {
+            this.smoothTarget.zero();
+        }
+
+        this.applyDeadBand();
+
         // deltaTicks() is ACS's realtime delta, so the spring is framerate independent - which is
         // the whole reason it hands that out instead of partialTick.
         return this.spring.step(
-                CfMath.exp(rotation), deltaTicks, (float) response, (float) damping);
+                CfMath.exp(this.heldTarget), deltaTicks, (float) response, (float) damping);
+    }
+
+    /**
+     * Slop, not a threshold.
+     *
+     * <p>Motion smaller than the dead band does not move the camera at all, which is what removes
+     * the micro-tremble. Past the dead band the target follows continuously, offset by the dead band
+     * - so there is no step, and therefore no stair-stepping, which is what a hard threshold would
+     * have traded the tremble for.</p>
+     */
+    private void applyDeadBand() {
+        final float band = (float) Math.toRadians(CfConfig.CAMERA_DEADBAND_DEG.get());
+
+        if (band <= 0.0f) {
+            this.heldTarget.set(this.smoothTarget);
+            return;
+        }
+
+        final Vector3f error = new Vector3f(this.smoothTarget).sub(this.heldTarget);
+        final float magnitude = error.length();
+
+        if (magnitude <= band || !Float.isFinite(magnitude)) {
+            return;
+        }
+
+        this.heldTarget.add(error.mul((magnitude - band) / magnitude));
+
+        if (!this.heldTarget.isFinite()) {
+            this.heldTarget.zero();
+        }
+    }
+
+    /**
+     * How fast felt-up is swinging, rad/s, smoothed.
+     *
+     * <p>This is the honest measure of "the direction of the force is changing", which is what a
+     * rider feels as a change of direction. It is zero for a steady spin however violent, and large
+     * for a genuine change however small the ride.</p>
+     */
+    private void updateTurnRate(final Vector3d up, final double dt) {
+        if (dt <= 0.0) {
+            return;
+        }
+
+        final double dot = Math.min(1.0, Math.max(-1.0, up.dot(this.previousUp)));
+        final double instant = Math.acos(dot) / dt;
+
+        this.previousUp.set(up);
+
+        if (!Double.isFinite(instant)) {
+            return;
+        }
+
+        // Smoothed, because one noisy frame should not spike the response the whole point of which
+        // is to be predictable.
+        final double blend = CfConfig.smoothingAlpha(0.09, dt);
+
+        this.turnRate += (instant - this.turnRate) * blend;
     }
 
     /**
@@ -182,7 +285,7 @@ public final class CfTiltSource implements TiltSource {
         final double period = flipRate > 1.0e-3 ? (2.0 * Math.PI / flipRate) : Double.MAX_VALUE;
         final double halfLife = Math.min(2.0, Math.max(0.25, 0.5 * Math.min(period, 4.0)));
 
-        final double blend = 1.0 - Math.pow(2.0, -dt / halfLife);
+        final double blend = CfConfig.smoothingAlpha(halfLife, dt);
 
         this.averageUp.lerp(feltUp, Math.min(1.0, Math.max(0.0, blend)));
 
@@ -192,12 +295,10 @@ public final class CfTiltSource implements TiltSource {
             this.averageUp.normalize();
         }
 
-        final double raw = (flipRate - LOOP_RATE_LOW) / (LOOP_RATE_HIGH - LOOP_RATE_LOW);
-        final double clamped = Math.min(1.0, Math.max(0.0, raw));
-        final double target = clamped * clamped * (3.0 - 2.0 * clamped);
+        final double target = CfConfig.smoothstep(flipRate, LOOP_RATE_LOW, LOOP_RATE_HIGH);
 
         // Charged rather than applied instantly, so one quick flick is not mistaken for a loop.
-        final double chargeBlend = 1.0 - Math.pow(2.0, -dt / 0.3);
+        final double chargeBlend = CfConfig.smoothingAlpha(0.3, dt);
 
         this.loopCharge += (target - this.loopCharge) * Math.min(1.0, Math.max(0.0, chargeBlend));
 
@@ -214,7 +315,7 @@ public final class CfTiltSource implements TiltSource {
         final double speed = Math.hypot(state.relativeVelocity.x, state.relativeVelocity.z);
         final double target = Math.min(1.0, speed / WALK_REFERENCE);
 
-        final double blend = 1.0 - Math.pow(2.0, -dt / 0.25);
+        final double blend = CfConfig.smoothingAlpha(0.25, dt);
 
         this.walkCharge += (target - this.walkCharge) * Math.min(1.0, Math.max(0.0, blend));
 
@@ -222,44 +323,45 @@ public final class CfTiltSource implements TiltSource {
     }
 
     /**
-     * Extra stiffness from a sharp manoeuvre, driven by the sub-level's angular acceleration.
+     * Extra stiffness from a change of direction.
      *
-     * <p>This is the fix for "sometimes far too strong, sometimes barely there". The old trigger was
-     * the magnitude of the centrifugal vector, which is {@code omega^2 * r} - it grows with radius
-     * and with steady spin, neither of which is a manoeuvre. Standing at the rim of a steadily
-     * rotating platform produced a large value while nothing was happening, and a genuinely sharp
-     * flick near the axis produced a small one. Angular acceleration is the derivative of the spin
-     * rate, so it is large exactly when the ride changes what it is doing and zero when it is doing
-     * the same thing quickly - which is what "sharp" means.</p>
+     * <p>Primarily the rate at which felt-down is swinging, with a smaller contribution from the
+     * sub-level's angular acceleration so that a sharp flick of the controls registers even before
+     * the force has finished moving. Both are derivatives: they are large exactly when the ride
+     * changes what it is doing, and zero when it is doing the same thing quickly - which is what
+     * "sharp" means.</p>
      *
      * <p>The curve is {@code x / (1 + x)}: monotonic, bounded by 1 and therefore by
      * {@code jolt_gain}, and with no knee to fall off. Predictable by construction rather than by
-     * tuning - twice the flick gives more response, always, and it cannot spike.</p>
+     * tuning - twice the swing gives more response, always, and it cannot spike.</p>
      */
-    private static double joltBoost(final ForceState state) {
+    private double joltBoost(final ForceState state) {
         final double gain = CfConfig.CAMERA_JOLT_GAIN.get();
 
         if (gain <= 0.0) {
             return 0.0;
         }
 
-        final double magnitude = state.angularAcceleration.length();
+        final double swing = this.turnRate / TURN_REFERENCE;
+        final double flick = state.angularAcceleration.length() / JOLT_REFERENCE;
 
-        if (!Double.isFinite(magnitude) || magnitude <= 0.0) {
+        final double x = swing + 0.5 * flick;
+
+        if (!Double.isFinite(x) || x <= 0.0) {
             return 0.0;
         }
-
-        final double x = magnitude / JOLT_REFERENCE;
 
         return gain * (x / (1.0 + x));
     }
 
     private void decay(final double dt) {
-        final double blend = Math.min(1.0, Math.max(0.0, 1.0 - Math.pow(2.0, -dt / 0.4)));
+        final double blend = CfConfig.smoothingAlpha(0.4, dt);
 
         this.loopCharge += (0.0 - this.loopCharge) * blend;
         this.walkCharge += (0.0 - this.walkCharge) * blend;
+        this.turnRate += (0.0 - this.turnRate) * blend;
         this.averageUp.lerp(new Vector3d(0.0, 1.0, 0.0), blend);
+        this.previousUp.set(0.0, 1.0, 0.0);
 
         if (this.averageUp.lengthSquared() < 1.0e-6 || !this.averageUp.isFinite()) {
             this.averageUp.set(0.0, 1.0, 0.0);

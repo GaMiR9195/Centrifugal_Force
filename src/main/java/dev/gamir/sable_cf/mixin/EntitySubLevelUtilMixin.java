@@ -16,11 +16,19 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
  * Fills in Sable's own extension point for "this entity is not upright".
  *
  * <p>{@code EntitySubLevelUtil.getCustomEntityOrientation} currently returns null unconditionally -
- * it is a declared-but-unimplemented hook. It is not dead code, though: Sable's
- * {@code GameRendererMixin} calls it every frame and, when it is non-null, computes the frame's
- * rotation delta in the returned orientation's <i>local</i> space before applying the yaw
- * compensation. That is exactly the correction a rotated body needs, so returning a real value here
- * makes Sable's existing yaw handling correct for a tilted player instead of fighting it.</p>
+ * it is a declared-but-unimplemented hook. It is not dead code, though, and it is worth being
+ * precise about what supplying it actually buys, because it is more than cosmetics:</p>
+ *
+ * <ul>
+ *   <li>{@code SubLevelEntityCollision} calls it once per collision substep and builds an
+ *       <b>oriented</b> bounding box from it, then runs SAT against sub-level blocks. So this one
+ *       return value is what turns the player's collision volume - genuinely rotated, not
+ *       approximated by a larger axis-aligned box. That is why this mod no longer touches
+ *       {@code Entity#makeBoundingBox} at all.</li>
+ *   <li>Sable's {@code GameRendererMixin} uses it to compute the frame's rotation delta in the
+ *       returned orientation's local space before applying yaw compensation, which is the
+ *       correction a tilted body needs.</li>
+ * </ul>
  *
  * <h2>Why only this method, and not hasCustomEntityOrientation</h2>
  *
@@ -51,7 +59,7 @@ public abstract class EntitySubLevelUtilMixin {
             final float partialTicks,
             final CallbackInfoReturnable<Quaterniondc> callback) {
 
-        if (entity == null || !CfConfig.SPEC.isLoaded() || !CfConfig.HITBOX_ENABLED.get()) {
+        if (entity == null || !CfConfig.SPEC.isLoaded()) {
             return;
         }
 
@@ -61,19 +69,25 @@ public abstract class EntitySubLevelUtilMixin {
 
         final BodyFrame frame = holder.sable_cf$bodyFrameOrNull();
 
-        if (frame == null || !frame.isTilted()) {
-            // Upright is not "no orientation" by accident - returning identity here would send
-            // Sable down its custom path to compute a delta that is provably identical to the one
-            // its default path already computes, for every player on every deck, every frame.
+        if (frame == null) {
             return;
         }
 
-        final Quaterniond orientation = new Quaterniond(frame.orientation());
+        final Quaterniondc orientation = frame.collisionOrientation();
 
-        if (!Double.isFinite(orientation.w) || orientation.angle() < 1.0e-4) {
+        // Upright is not "no orientation" by accident - returning identity here would send Sable
+        // down its custom path to compute a delta that is provably identical to the one its default
+        // path already computes, for every player on every deck, every frame.
+        if (orientation == null) {
             return;
         }
 
-        callback.setReturnValue(orientation.normalize());
+        final Quaterniond copy = new Quaterniond(orientation);
+
+        if (!Double.isFinite(copy.w) || copy.angle() < 1.0e-4) {
+            return;
+        }
+
+        callback.setReturnValue(copy.normalize());
     }
 }
