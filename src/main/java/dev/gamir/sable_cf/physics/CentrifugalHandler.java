@@ -1,685 +1,361 @@
 package dev.gamir.sable_cf.physics;
 
 import dev.gamir.sable_cf.CfConfig;
-import dev.gamir.sable_cf.compat.SableAccess;
-import dev.ryanhcode.sable.sublevel.SubLevel;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.event.tick.PlayerTickEvent;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
 /**
- * Where the forces are actually applied.
+ * Turns the body frame's decisions into an actual change in the player's velocity.
  *
- * <h2>What gets applied, and what deliberately does not</h2>
+ * <h2>The one rule that keeps this honest</h2>
  *
- * <p>Only <b>fictitious</b> terms: the deck's frame acceleration, Coriolis, drag, and the two
- * deliberate gameplay pushes (the outward creep and the wall assist). Gravity is never applied here
- * - vanilla already does that. Getting it wrong doubles gravity, and it is why {@code apparent}
- * exists purely as a reported quantity rather than as something summed into the player.</p>
+ * <p>Minecraft has already applied gravity by the time this runs. So what is added here is</p>
  *
- * <p>The consequence worth stating plainly: on a sub-level that is merely travelling - a lift, a
- * ship under way, a drawbridge - every one of those terms is zero, so this handler adds exactly
- * nothing and movement is bit-for-bit vanilla. Not a tuned threshold; what the terms evaluate to.
- * </p>
+ * <pre>applied = wanted - gravity</pre>
  *
- * <h2>A slide has to have a terminal speed</h2>
+ * <p>and the immediate consequence is the correctness test this whole file is built around:
+ * <b>standing on a stationary deck, {@code applied} is exactly zero</b>. No ride means no stick,
+ * no stick means nothing is cancelled, the only load is gravity, and gravity minus gravity is
+ * nothing. The mod cannot perturb ordinary play, not because the thresholds are set high but
+ * because there is nothing for it to add.</p>
  *
- * <p>Coulomb friction is one comparison - friction holds up to {@code mu * press} and only the
- * excess moves you - and that is still the model here. But an excess applied every tick with
- * nothing watching the result is not a slide, it is an engine: a single hard turn started a slide
- * that never stopped, and the only way to make it stop was to raise {@code grip} until the gate
- * never opened at all. That is what "grip 4 and it stopped shoving me" was really reporting.</p>
+ * <h2>One friction solve, not three</h2>
  *
- * <p>Two bounds fix it without adding a state machine. The excess is capped in <i>acceleration</i>
- * by {@code slide_cap_g}, so a violent ride shoves rather than deletes; and it fades against the
- * measured deck-relative speed, so the slide approaches a terminal drift. Both are limits on the
- * push, never a brake on the player - a brake would fight walking, and the player walking is not
- * something this mod is entitled to oppose.</p>
+ * <p>The previous version had a wall assist that cancelled tangential gravity, a separate slide
+ * solver that considered only the fictitious forces, and a grip gate in front of both. Gravity was
+ * therefore handled by the assist and invisible to the slide solver, which is why sliding felt
+ * disconnected from the thing that was making you slide, and why turning grip up to 3 made the
+ * sliding vanish rather than merely reduce - the gate closed completely before the solver ever
+ * ran.</p>
  *
- * <h2>Velocity across the deck is measured, not inferred</h2>
+ * <p>Here every felt acceleration - ride, gravity and drag - goes into one load, and one Coulomb
+ * solve decides how much of it the contact can hold:</p>
  *
- * <p>Sable carries a standing player by moving their <i>position</i> through the pose, and never
- * touches {@code deltaMovement}. So {@code deltaMovement} is blind to sliding across the deck: a
- * player dragged outward at three metres a second reports zero. Every speed limit here reads
- * {@link BodyFrame#deckRelativeVelocity()}, which is differenced from the player's local position
- * and therefore sees what is actually happening. A limiter that cannot observe the quantity it
- * limits is not a limiter.</p>
- *
- * <h2>Drag is measured against the air the deck carries</h2>
- *
- * <p>The rigid translation is subtracted first. Feeding a player's world velocity to a drag law
- * tells someone standing still on a deck cruising at 25 m/s that they are in a 25 m/s gale. What
- * survives is exactly what should: rotation does not move the pose's rotation centre, so
- * {@code omega x r} is untouched and a spinner still tries to peel you off, while pure translation
- * cancels to zero identically.</p>
+ * <ol>
+ *   <li><b>Stick cancels.</b> Being a wall-walker means the surface holds you the way a floor
+ *       would, so {@code stick} of the tangential ride-and-gravity load simply does not reach you.
+ *       At the top of a loop it also cancels {@code stick} of the outward pull, which is what makes
+ *       hanging there possible at all.</li>
+ *   <li><b>Friction holds what it can.</b> Budget is {@code grip * press * footing}, with a bonus
+ *       while you are actively pushing into the surface. Under the budget nothing moves; over it,
+ *       only the excess gets through. Not a gate - a threshold that the load is measured against
+ *       and the remainder passed on, so grip 3 makes slides slower, never absent.</li>
+ *   <li><b>Slides reach a terminal speed.</b> The excess is opposed by a viscous term rather than
+ *       clipped, so a slip accelerates, settles, and stops accelerating. Clipping the acceleration
+ *       - the old behaviour - produces a slide that keeps gaining speed as long as the load is over
+ *       the budget, which is the "strange and nasty" part: it never converges to anything, so it
+ *       never feels like sliding, only like losing control.</li>
+ *   <li><b>Air resistance always gets through.</b> A fraction of tangential drag bypasses friction
+ *       entirely, because the player's model is that air is the one thing that can unstick you.
+ *       It is self-limiting: the bypass is paired with a damping term sized so the drift settles at
+ *       {@code air_resistance.slide_max_speed} and stays there. On a "solnyshko" that is a slow,
+ *       constant slide down the deck that you can walk against - present, controllable, and
+ *       incapable of building into a launch.</li>
+ * </ol>
  */
 public final class CentrifugalHandler {
 
+    /** m/s^2 to blocks/tick of velocity: a * dt gives m/s, times dt again gives blocks/tick. */
+    private static final double ACCEL_TO_DELTA = CfConfig.TICK * CfConfig.TICK;
+
+    /** Below this the stick is gone; above it, it was real. Used only to notice a sudden loss. */
+    private static final double RELEASE_STICK_HIGH = 0.45;
+
+    private static final double RELEASE_STICK_LOW = 0.12;
+
+    /** How long to keep smoothing after a ride ends, ticks. */
+    private static final int RELEASE_TICKS = 8;
+
     /**
-     * Acceleration in m/s^2 to a velocity delta in blocks/tick: {@code a/20} m/s over one tick,
-     * divided by 20 again to get blocks/tick. Forgetting the second division is a factor-of-twenty
-     * error that looks like the mod working perfectly on one machine.
+     * The last state actually applied, for {@code /sable_cf status} and the overlay.
+     *
+     * <p>A snapshot rather than a second copy: it points at the live {@link ForceState} owned by
+     * the body frame, so it cannot drift from what the physics used. Empty on a dedicated server,
+     * where forces are the client's job and the honest answer is "nothing here".</p>
      */
-    public static final double ACCEL_TO_DELTA = 1.0 / 400.0;
+    private static volatile ForceState lastState = new ForceState();
 
-    /** Above this press, in g, fall damage is suppressed: you are being held, not falling. */
-    private static final double FALL_RESET_G = 1.5;
+    public static ForceState lastState() {
+        return lastState;
+    }
 
-    /** Below this walk-assist fade the keys are not re-based; only gravity is cancelled. */
-    private static final double WALK_ASSIST_MIN = 0.35;
-
-    public static final ForceState STATE = new ForceState();
-
-    private static final Vector3dc WORLD_UP = new Vector3d(0.0, 1.0, 0.0);
+    private int releaseTicks;
 
     @SubscribeEvent
-    public void onClientTick(final ClientTickEvent.Post event) {
-        final Minecraft minecraft = Minecraft.getInstance();
-        final LocalPlayer player = minecraft.player;
+    public void onPlayerTick(final PlayerTickEvent.Post event) {
+        final Player player = event.getEntity();
 
-        if (player == null || minecraft.isPaused() || !CfConfig.SPEC.isLoaded()) {
-            STATE.clear();
+        if (!player.isLocalPlayer()) {
+            // Physics is applied by whoever owns the entity. Doing it for remote players would
+            // fight their own updates, and doing it on the server would fight the client's.
             return;
         }
 
         if (!(player instanceof BodyFrameHolder holder)) {
-            STATE.clear();
             return;
         }
 
         final BodyFrame frame = holder.sable_cf$bodyFrameOrNull();
-        final SubLevel subLevel = SableAccess.tracking(player);
 
-        if (frame == null || !frame.isActive() || subLevel == null || subLevel.isRemoved()) {
-            STATE.clear();
+        if (frame == null) {
             return;
         }
 
-        STATE.clear();
-        STATE.active = true;
+        final ForceState state = frame.state();
 
-        final double gravity = CfConfig.GRAVITY;
-        final Vec3 position = player.position();
-
-        // ------------------------------------------------------------ velocities
-
-        final Vec3 deckVec = SableAccess.pointVelocity(subLevel, position);
-        final Vector3d deck = new Vector3d(deckVec.x, deckVec.y, deckVec.z);
-        final Vector3d translation = new Vector3d(frame.deckTranslation());
-
-        // Measured, not inferred. See the class note.
-        final Vector3d deckRelative = new Vector3d(frame.deckRelativeVelocity());
-
-        if (!deckRelative.isFinite()) {
-            deckRelative.zero();
-        }
-
-        final Vec3 ownVec = player.getDeltaMovement().scale(20.0);
-        final Vector3d own = new Vector3d(ownVec.x, ownVec.y, ownVec.z);
-
-        if (!own.isFinite()) {
-            own.zero();
-        }
-
-        final Vec3 windVec = SableAccess.wind(player.level(), position);
-
-        // deck - translation is exactly the rotational part, omega x r.
-        final Vector3d air = new Vector3d(deck).sub(translation).add(deckRelative)
-                .sub(windVec.x, windVec.y, windVec.z);
-
-        if (!air.isFinite()) {
-            air.zero();
-        }
-
-        STATE.deckVelocity.set(deck);
-        STATE.deckTranslation.set(translation);
-        STATE.deckRelativeVelocity.set(deckRelative);
-        STATE.relativeVelocity.set(own);
-        STATE.airVelocity.set(air);
-        STATE.omega.set(frame.omega());
-        STATE.angularAcceleration.set(frame.angularAcceleration());
-        STATE.normal.set(frame.normal());
-        STATE.frameAcceleration.set(frame.frameAcceleration());
-        STATE.apparent.set(frame.apparent());
-        STATE.tilt = frame.tilt();
-        STATE.ridePress = frame.ridePress();
-        STATE.frameShare = frame.frameShare();
-        STATE.spinGate = frame.spinGate();
-        STATE.contactCount = frame.contacts().count();
-        STATE.attached = frame.isAttached();
-        STATE.attachNormal.set(frame.attachNormal());
-
-        // The camera's target. Derived from the same body orientation the hitbox follows, so the
-        // two cannot drift into "the view leans one way and the body is somewhere else".
-        STATE.bodyUp.set(0.0, 1.0, 0.0);
-        frame.orientation().transform(STATE.bodyUp);
-
-        if (!STATE.bodyUp.isFinite() || STATE.bodyUp.lengthSquared() < 1.0e-9) {
-            STATE.bodyUp.set(0.0, 1.0, 0.0);
-        }
-
-        // ------------------------------------------------------------ the launch case
-
-        if (frame.releaseTriggered()) {
-            this.launch(player, frame);
-            frame.consumeRelease();
-            STATE.released = true;
+        if (player.isSpectator() || player.getAbilities().flying || player.isPassenger()) {
+            this.releaseTicks = 0;
+            state.clear();
             return;
         }
 
-        // Jumping always breaks a latch. Being stuck to a wall with no way off is a trap, and
-        // pressing jump is the least ambiguous "let go" signal there is.
-        if (frame.isAttached() && player.input != null && player.input.jumping) {
-            frame.detach();
+        if (!frame.active()) {
+            this.decayRelease(player, frame);
+            return;
         }
 
-        // ------------------------------------------------------------ the terms
+        lastState = state;
 
-        final double strength = CfConfig.CENTRIFUGAL_ENABLED.get()
-                ? CfConfig.CENTRIFUGAL_STRENGTH.get()
-                : 0.0;
+        this.apply(player, frame, state);
+    }
 
-        // What the player feels as being flung: the reaction to the deck's own acceleration.
-        final Vector3d rideLoad = new Vector3d(frame.frameAcceleration()).mul(-strength);
+    private void apply(final Player player, final BodyFrame frame, final ForceState state) {
+        final Vector3dc normal = frame.planeNormal();
+        final double stick = CfConfig.clamp01(frame.stick());
 
-        this.splitCentrifugal(frame, rideLoad, strength);
-
-        final Vector3d coriolis = new Vector3d();
-
-        if (strength > 0.0 && CfConfig.CORIOLIS_STRENGTH.get() > 0.0) {
-            // -2 omega x v_rel. Only the player's own motion counts: the deck's velocity is already
-            // in the frame acceleration, and double counting turns a turntable into a catapult.
-            frame.omega().cross(own.x, own.y, own.z, coriolis);
-            coriolis.mul(-2.0 * CfConfig.CORIOLIS_STRENGTH.get());
-
-            if (!coriolis.isFinite()) {
-                coriolis.zero();
-            }
-        }
-
+        // ---- air resistance.
+        //
+        // Quadratic-ish in speed and soft-capped, so it is negligible at walking pace and becomes
+        // the dominant nuisance at ride speed - which is what makes it the thing that decides
+        // whether you can hold your footing on a fast wheel.
         final Vector3d drag = new Vector3d();
 
-        if (CfConfig.AIR_ENABLED.get()) {
-            final double airSpeed = air.length();
-            final double magnitude = CfConfig.dragMagnitude(airSpeed);
+        if (CfConfig.AIR_ENABLED.get() && state.airSpeed > 1.0e-4) {
+            final double magnitude = CfConfig.dragMagnitude(state.airSpeed)
+                    * CfConfig.AIR_STRENGTH.get();
 
-            if (airSpeed > 1.0e-6 && magnitude > 0.0) {
-                drag.set(air).div(airSpeed).mul(-magnitude);
-            }
+            drag.set(state.airVelocity).normalize(magnitude).negate();
         }
 
-        STATE.coriolis.set(coriolis);
-        STATE.drag.set(drag);
-
-        // ------------------------------------------------------------ friction
-
-        final Vector3d normal = new Vector3d(frame.normal());
-
-        if (normal.lengthSquared() < 1.0e-9) {
-            normal.set(WORLD_UP);
-        } else {
-            normal.normalize();
+        if (!drag.isFinite()) {
+            drag.zero();
         }
 
-        final Vector3d load = new Vector3d(rideLoad).add(coriolis).add(drag);
+        state.drag.set(drag);
 
-        // Total normal load includes gravity: friction does not care where the press came from, it
-        // is what is squeezing your boots against the surface.
-        final double press = Math.max(0.0, -(new Vector3d(frame.apparent()).add(drag)).dot(normal));
+        // ---- the load, and how it splits about the floor.
+        final Vector3d rideAndGravity = new Vector3d(state.apparent);
+        final Vector3d load = new Vector3d(rideAndGravity).add(drag);
 
-        final boolean bracing = player.isShiftKeyDown();
-        final boolean hasSurface = frame.contacts().any();
+        final double pressTotal = -load.dot(normal);
+        final double rgNormal = rideAndGravity.dot(normal);
 
-        final double friction = CfConfig.GRIP_ENABLED.get()
-                ? CfConfig.GRIP_STRENGTH.get() * (bracing ? CfConfig.GRIP_BRACE_BONUS.get() : 1.0)
+        final Vector3d rgTangential = new Vector3d(rideAndGravity).fma(-rgNormal, normal);
+
+        // ---- what the stick cancels.
+        //
+        // Tangential ride-and-gravity, because standing on a wall means gravity stops dragging you
+        // along it; and the OUTWARD half of the normal load, because at the top of a loop that is
+        // the only thing between you and the ground.
+        final Vector3d assist = new Vector3d(rgTangential).mul(-stick);
+
+        if (rgNormal > 0.0) {
+            assist.fma(-stick * rgNormal, normal);
+        }
+
+        final Vector3d rest = new Vector3d(load).add(assist);
+
+        // ---- friction.
+        //
+        // Adhesion clause: when the load is trying to pull you OFF the surface, the stick supplies
+        // the press instead. Without it, hanging at the top of a loop would come with zero grip and
+        // you would slide off sideways while still nominally attached - the worst of both.
+        final double effectivePress = pressTotal >= 0.0 ? pressTotal : stick * -pressTotal;
+
+        final double footing = CfConfig.footing(effectivePress);
+        state.footing = footing;
+
+        final double brace = brace(player);
+        state.bracing = brace > 0.05;
+
+        final double limit = CfConfig.GRIP_ENABLED.get()
+                ? CfConfig.GRIP_STRENGTH.get() * effectivePress * footing
+                        * (1.0 + CfConfig.GRIP_BRACE_BONUS.get() * brace)
                 : 0.0;
 
-        final double hold = hasSurface ? friction * press : 0.0;
+        final double restNormal = rest.dot(normal);
+        final Vector3d tangential = new Vector3d(rest).fma(-restNormal, normal);
 
-        final double normalComponent = load.dot(normal);
-        final Vector3d tangential = new Vector3d(load)
-                .sub(normal.x * normalComponent, normal.y * normalComponent, normal.z * normalComponent);
+        // Air's share, pulled out before the solve so friction can never take all of it away.
+        final Vector3d dragTangential = new Vector3d(drag).fma(-drag.dot(normal), normal);
+        final Vector3d bypass = new Vector3d(dragTangential)
+                .mul(CfConfig.AIR_SLIDE.get() * stick);
 
-        final double tangentialLoad = tangential.length();
+        tangential.sub(bypass);
 
-        STATE.press = press;
-        STATE.hold = hold;
-        STATE.tangentialLoad = tangentialLoad;
-        STATE.bracing = bracing;
-        STATE.gripped = hasSurface && press > CfConfig.GRIP_MIN_PRESS_G.get() * gravity;
-        STATE.wallRide = STATE.gripped && Math.abs(normal.dot(WORLD_UP)) < CfConfig.WALL_COSINE;
+        final double tangentialMagnitude = tangential.length();
+        state.tangentialLoad = tangentialMagnitude;
 
-        final Vector3d applied = new Vector3d();
+        double hold = tangentialMagnitude;
 
-        applied.add(this.pressInto(normal, normalComponent, deckRelative));
-        applied.add(this.slide(tangential, tangentialLoad, hold, deckRelative));
+        if (tangentialMagnitude > limit) {
+            hold = limit;
 
-        // ------------------------------------------------------------ deliberate pushes
+            // Only the excess survives. A proportional cut, not a clip: doubling grip halves the
+            // slide instead of switching it off.
+            tangential.mul((tangentialMagnitude - limit) / tangentialMagnitude);
+            state.slipping = true;
+        } else {
+            tangential.zero();
+            state.slipping = false;
+        }
 
-        applied.add(this.outwardCreep(frame, rideLoad, normal, deckRelative));
-        applied.add(this.wallAssist(player, frame, normal, press, deckRelative));
-        applied.add(this.adhesion(frame));
+        state.hold = hold;
+        state.gripped = limit > 0.0 && !state.slipping;
 
-        // ------------------------------------------------------------ apply
+        // ---- viscous terms, so every slide has a terminal speed.
+        final Vector3d relative = new Vector3d(state.relativeVelocity);
+        final Vector3d relativeTangential = new Vector3d(relative)
+                .fma(-relative.dot(normal), normal);
+
+        if (state.slipping && CfConfig.GRIP_SLIDE_DAMPING.get() > 0.0) {
+            tangential.fma(-CfConfig.GRIP_SLIDE_DAMPING.get(), relativeTangential);
+        }
+
+        final double slideCap = CfConfig.GRIP_SLIDE_CAP_G.get() * CfConfig.GRAVITY;
+
+        if (tangential.length() > slideCap) {
+            tangential.normalize(slideCap);
+        }
+
+        // Air's share is self-limiting: paired with damping sized so the drift settles at the
+        // configured speed and then stops growing. This is the "it slides you off the solnyshko a
+        // little" behaviour, and it converges by construction rather than by tuning.
+        final double bypassMagnitude = bypass.length();
+
+        if (bypassMagnitude > 1.0e-6) {
+            final double terminal = Math.max(0.2, CfConfig.AIR_SLIDE_MAX_SPEED.get());
+
+            bypass.fma(-bypassMagnitude / terminal, relativeTangential);
+        }
+
+        state.slip.set(tangential).add(bypass);
+
+        // ---- put it back together.
+        final Vector3d wanted = new Vector3d(normal).mul(restNormal)
+                .add(tangential)
+                .add(bypass);
+
+        // Minecraft has already applied gravity this tick, so only the difference is ours to add.
+        final Vector3d applied = new Vector3d(wanted).add(0.0, CfConfig.GRAVITY, 0.0);
+
+        this.addRelease(player, frame, applied, relative);
+
+        final double cap = CfConfig.MAX_ACCEL_G.get() * CfConfig.GRAVITY;
+
+        if (applied.length() > cap) {
+            applied.normalize(cap);
+        }
 
         if (!applied.isFinite()) {
             return;
         }
 
-        final double cap = CfConfig.MAX_ACCEL_G.get() * gravity;
-        final double magnitude = applied.length();
-
-        // A contraption that teleports produces one tick of enormous bogus acceleration. Without
-        // this rail that single tick launches the player into orbit.
-        if (magnitude > cap && magnitude > 1.0e-9) {
-            applied.mul(cap / magnitude);
-        }
-
-        STATE.applied.set(applied);
-
-        if (applied.lengthSquared() < 1.0e-12) {
-            return;
-        }
+        state.applied.set(applied);
 
         player.setDeltaMovement(player.getDeltaMovement().add(
-                applied.x * ACCEL_TO_DELTA, applied.y * ACCEL_TO_DELTA, applied.z * ACCEL_TO_DELTA));
-
-        // Being pressed into a drum wall is not falling, whatever the vertical delta says. The
-        // server keeps its own fall counter from position deltas, so this only fixes the client's
-        // opinion - use /gamerule fallDamage false while testing rides.
-        if (press > FALL_RESET_G * gravity) {
-            player.fallDistance = 0.0f;
-        }
+                applied.x * ACCEL_TO_DELTA,
+                applied.y * ACCEL_TO_DELTA,
+                applied.z * ACCEL_TO_DELTA));
     }
 
     /**
-     * The component that pins you to the surface, faded out once you are already closing on it.
+     * Catches the moment a ride stops holding you and takes the edge off it.
      *
-     * <p>This used to be applied in full, unconditionally, on the reasoning that collision would
-     * eat whatever was pointed into the surface. It does not. Sable resolves contact
-     * <i>positionally</i> and never zeroes {@code deltaMovement} against a sub-level face, so the
-     * into-surface velocity is kept and added to every tick. Nothing looks wrong while it builds,
-     * because the position is being corrected each tick anyway - and then one tick resolves the
-     * accumulated penetration all at once and the player is fired through the wall.</p>
-     *
-     * <p>Pushing away from the surface is never faded: that is you leaving, and you are allowed to
-     * leave.</p>
+     * <p>Not a safety net for bad physics - the physics is right, and the physics says that letting
+     * go of a wheel at 20 m/s launches you at 20 m/s. That is correct and it is also unplayable, so
+     * the first few ticks of it are damped. Only the velocity <i>relative to the deck</i> is
+     * touched, so being carried along by the contraption is preserved exactly; what gets removed is
+     * the part that came from the ride flinging you.</p>
      */
-    private Vector3d pressInto(final Vector3dc normal, final double normalComponent,
-                               final Vector3dc deckRelative) {
-
-        final Vector3d result = new Vector3d(normal).mul(normalComponent);
-
-        if (normalComponent >= 0.0) {
-            return result;
-        }
-
-        final double limit = CfConfig.PRESS_MAX_SPEED;
-
-        if (!(limit > 0.0)) {
-            return result;
-        }
-
-        // Positive when the player is closing on the surface.
-        final double approach = -deckRelative.dot(normal);
-        final double room = Math.min(1.0, Math.max(0.0, (limit - approach) / limit));
-
-        return result.mul(room);
-    }
-
-    /**
-     * The excess past friction, bounded twice.
-     *
-     * <p>{@code slide_cap_g} bounds the acceleration, so a contraption snapping sideways shoves you
-     * rather than evicting you. The speed fade bounds the outcome, so the slide settles at a
-     * terminal drift instead of accelerating for as long as the ride keeps turning.</p>
-     *
-     * <p>Both are limits on the push and neither is a brake on the player. That distinction is
-     * deliberate: a brake would have to oppose the deck-relative velocity, which contains the
-     * player's own walking, and opposing the player walking is not something this mod is entitled
-     * to do.</p>
-     */
-    private Vector3d slide(final Vector3dc tangential, final double tangentialLoad,
-                           final double hold, final Vector3dc deckRelative) {
-
-        final Vector3d result = new Vector3d();
-
-        if (tangentialLoad <= 1.0e-9 || tangentialLoad <= hold) {
-            return result;
-        }
-
-        final Vector3d direction = new Vector3d(tangential).div(tangentialLoad);
-
-        double excess = tangentialLoad - hold;
-
-        final double accelCap = CfConfig.GRIP_SLIDE_CAP_G.get() * CfConfig.GRAVITY;
-
-        if (excess > accelCap) {
-            excess = accelCap;
-        }
-
-        final double limit = CfConfig.AIR_SLIDE_MAX_SPEED.get();
-
-        if (limit > 0.0) {
-            final double already = deckRelative.dot(direction);
-
-            excess *= Math.min(1.0, Math.max(0.0, (limit - already) / limit));
-        }
-
-        if (excess <= 1.0e-9) {
-            return result;
-        }
-
-        STATE.slipping = STATE.gripped;
-        STATE.slip.set(direction).mul(excess / 20.0);
-
-        return result.set(direction).mul(excess);
-    }
-
-    /**
-     * The deliberate outward creep - now part of {@code air_resistance}, not a knob of its own.
-     *
-     * <p>In a drum you should ease from the middle out to the rim and end up leaning on the lip.
-     * Friction alone will not do it: friction is symmetric, so once it holds you it holds you
-     * exactly where you are and the ride never moves you anywhere.</p>
-     *
-     * <p>It lives under air resistance because it is the same idea - the ride peeling you off - and
-     * having it under a second switch meant turning air resistance off did not stop you sliding,
-     * which is not a thing anyone could have guessed from the name.</p>
-     */
-    private Vector3d outwardCreep(
-            final BodyFrame frame, final Vector3dc rideLoad,
-            final Vector3dc normal, final Vector3dc deckRelative) {
-
-        final Vector3d result = new Vector3d();
-
-        if (!CfConfig.AIR_ENABLED.get() || !frame.contacts().any()) {
-            return result;
-        }
-
-        final double gate = frame.spinGate();
-        final double strength = CfConfig.AIR_SLIDE.get() * CfConfig.AIR_STRENGTH.get();
-
-        if (gate <= 0.0 || strength <= 0.0) {
-            return result;
-        }
-
-        // Outward is where the ride is throwing you, projected onto the surface: sliding happens
-        // along a surface, and the part pointing into it is press, not creep.
-        final Vector3d outward = new Vector3d(rideLoad);
-        final double intoSurface = outward.dot(normal);
-
-        outward.sub(normal.x() * intoSurface, normal.y() * intoSurface, normal.z() * intoSurface);
-
-        final double magnitude = outward.length();
-
-        if (magnitude < 1.0e-6) {
-            return result;
-        }
-
-        outward.div(magnitude);
-
-        final double limit = CfConfig.AIR_SLIDE_MAX_SPEED.get();
-
-        if (!(limit > 0.0)) {
-            return result;
-        }
-
-        // Fades to nothing at the cap, so the creep approaches a terminal drift rather than being
-        // cut off at one.
-        final double already = deckRelative.dot(outward);
-        final double room = Math.min(1.0, Math.max(0.0, (limit - already) / limit));
-
-        if (room <= 0.0) {
-            return result;
-        }
-
-        result.set(outward).mul(magnitude * strength * gate * room);
-        STATE.outwardSlip.set(result);
-
-        return result;
-    }
-
-    /**
-     * Wall walking, in two halves.
-     *
-     * <p><b>Half one</b> cancels a share of the along-surface pull of gravity, in proportion to how
-     * hard the ride is pressing you in. That is the honest model: a rider in a real rotor walks up
-     * the drum because centrifugal press gives their boots enough friction to beat gravity along
-     * the wall - not because the world rotated for them, and not because they are glued on.</p>
-     *
-     * <p><b>Half two</b> re-bases the walk keys into the surface plane, and it is the half that was
-     * missing. Cancelling gravity only ever bought the right to <i>hover</i>: you press W,
-     * Minecraft resolves your input in the horizontal world plane, pushes you straight into the
-     * wall, and nothing happens. Forward has to mean "forward along the surface" before a wall can
-     * be walked on, and no amount of force in the other half produces that.</p>
-     *
-     * <p>Gated on the ride's <i>share</i> of the press rather than on raw press, which is what
-     * keeps an ordinary floor - pressed at a full gravity, by gravity - from becoming climbable.
-     * Not gated on the surface being a wall by world up, so it works just as well on what is over
-     * your head at the top of a loop, which is exactly the ride this mod is for.</p>
-     */
-    private Vector3d wallAssist(final LocalPlayer player, final BodyFrame frame,
-                                final Vector3dc normal, final double press,
-                                final Vector3dc deckRelative) {
-
-        final Vector3d result = new Vector3d();
-
-        if (!CfConfig.WALL_ENABLED.get() || !frame.contacts().any()) {
-            return result;
-        }
-
-        final double gate = frame.spinGate() * CfConfig.climbWeight(frame.frameShare());
-
-        if (gate <= 1.0e-3) {
-            return result;
-        }
-
-        final double gravity = CfConfig.GRAVITY;
-
-        final double ramp = CfConfig.smoothstep(press,
-                CfConfig.GRIP_FULL_PRESS_G.get() * gravity,
-                CfConfig.WALL_PRESS_G.get() * gravity);
-
-        if (ramp <= 1.0e-3) {
-            return result;
-        }
-
-        final double amount = Math.min(1.0, ramp * gate) * CfConfig.WALL_STRENGTH.get();
-
-        if (amount <= 1.0e-3) {
-            return result;
-        }
-
-        // Gravity's pull along the surface - the thing that stops you walking up it.
-        final Vector3d alongSurface = new Vector3d(0.0, -gravity, 0.0);
-        final double into = alongSurface.dot(normal);
-
-        alongSurface.sub(normal.x() * into, normal.y() * into, normal.z() * into);
-
-        if (alongSurface.lengthSquared() > 1.0e-9) {
-            result.fma(-Math.min(1.0, amount), alongSurface);
-        }
-
-        if (amount >= WALK_ASSIST_MIN) {
-            final Vector3d desired = walkDirection(player, normal);
-
-            if (desired.lengthSquared() > 1.0e-6) {
-                final double limit = CfConfig.WALL_MAX_SPEED.get();
-
-                final double already = deckRelative.dot(desired);
-                final double room = limit > 0.0
-                        ? Math.min(1.0, Math.max(0.0, (limit - already) / limit))
-                        : 0.0;
-
-                if (room > 0.0) {
-                    result.fma(CfConfig.WALL_WALK_ACCEL * amount * room, desired);
-                }
-            }
-        }
-
-        STATE.climbAssist.set(result);
-
-        return result;
-    }
-
-    /**
-     * The walk keys, expressed as a unit direction in the surface plane.
-     *
-     * <p>Forward is where you are looking, flattened onto the surface rather than onto the world's
-     * horizontal plane - so on a drum wall "forward" is up the wall when you look up it. Left is
-     * {@code normal x forward}, which reduces to the vanilla left when the normal is world up, so
-     * nothing changes on an ordinary floor.</p>
-     */
-    private static Vector3d walkDirection(final LocalPlayer player, final Vector3dc normal) {
-        final Vector3d out = new Vector3d();
-
-        if (player.input == null) {
-            return out;
-        }
-
-        final double forwardImpulse = player.input.forwardImpulse;
-        final double leftImpulse = player.input.leftImpulse;
-
-        if (Math.abs(forwardImpulse) < 1.0e-3 && Math.abs(leftImpulse) < 1.0e-3) {
-            return out;
-        }
-
-        final Vec3 look = player.getLookAngle();
-        final Vector3d forward = new Vector3d(look.x, look.y, look.z);
-
-        projectOntoPlane(forward, normal);
-
-        if (forward.lengthSquared() < 1.0e-6) {
-            // Looking straight at the surface leaves nothing to project. Fall back to the body's
-            // yaw, which still has a component in the plane.
-            final double yaw = Math.toRadians(player.getYRot());
-
-            forward.set(-Math.sin(yaw), 0.0, Math.cos(yaw));
-            projectOntoPlane(forward, normal);
-
-            if (forward.lengthSquared() < 1.0e-6) {
-                return out;
-            }
-        }
-
-        forward.normalize();
-
-        final Vector3d left = new Vector3d(normal).cross(forward);
-
-        if (left.lengthSquared() < 1.0e-9) {
-            return out;
-        }
-
-        left.normalize();
-
-        out.set(forward).mul(forwardImpulse).fma(leftImpulse, left);
-
-        final double length = out.length();
-
-        if (length < 1.0e-6 || !Double.isFinite(length)) {
-            out.zero();
-            return out;
-        }
-
-        return out.div(length);
-    }
-
-    private static void projectOntoPlane(final Vector3d vector, final Vector3dc normal) {
-        final double along = vector.dot(normal);
-
-        vector.sub(normal.x() * along, normal.y() * along, normal.z() * along);
-
-        if (!vector.isFinite()) {
-            vector.zero();
-        }
-    }
-
-    /**
-     * Splits the ride load into a centrifugal part and everything else, for display only.
-     *
-     * <p>Nothing downstream of the debug overlay depends on this being exact - the physics uses the
-     * total, which is the point of taking it from Sable's velocity field rather than assembling it
-     * by hand.</p>
-     */
-    private void splitCentrifugal(
-            final BodyFrame frame, final Vector3dc rideLoad, final double strength) {
-
-        final Vector3d omega = new Vector3d(frame.omega());
-        final double spin = omega.length();
-
-        if (spin < 1.0e-6 || strength <= 0.0) {
-            STATE.euler.set(rideLoad);
+    private void addRelease(final Player player, final BodyFrame frame,
+                            final Vector3d applied, final Vector3dc relative) {
+
+        if (!CfConfig.RELEASE_ENABLED.get()) {
+            this.releaseTicks = 0;
             return;
         }
 
-        final Vector3d axis = new Vector3d(omega).div(spin);
-        final Vector3d load = new Vector3d(rideLoad);
-
-        final double alongAxis = load.dot(axis);
-        final Vector3d perpendicular = new Vector3d(load)
-                .sub(axis.x * alongAxis, axis.y * alongAxis, axis.z * alongAxis);
-
-        STATE.centrifugal.set(perpendicular);
-        STATE.euler.set(load).sub(perpendicular);
-    }
-
-    /**
-     * A small pull into the surface while latched.
-     *
-     * <p>Sable resolves contact in a limited number of substeps, so a body exactly touching a
-     * moving wall drifts a hair off it and back every tick, and "stuck to the drum" becomes a coin
-     * flip. This keeps the contact closed so the state is stable. It is emphatically not what holds
-     * the player up - friction does that. Raising it does not help you stick, it only makes letting
-     * go feel sticky.</p>
-     */
-    private Vector3d adhesion(final BodyFrame frame) {
-        final Vector3d result = new Vector3d();
-
-        if (!frame.isAttached()) {
-            return result;
+        if (frame.previousStick() > RELEASE_STICK_HIGH && frame.stick() < RELEASE_STICK_LOW) {
+            this.releaseTicks = RELEASE_TICKS;
         }
 
-        final double amount = CfConfig.ATTACH_ADHESION_G.get() * CfConfig.GRAVITY;
-
-        if (amount <= 0.0) {
-            return result;
-        }
-
-        return result.set(frame.attachNormal()).mul(-amount);
-    }
-
-    /**
-     * The deck stopped; the player did not.
-     *
-     * <p>{@link BodyFrame} only ever raises the flag for a player who was already latched, which is
-     * what keeps this from becoming "players ricochet off contraptions".</p>
-     */
-    private void launch(final LocalPlayer player, final BodyFrame frame) {
-        final Vector3d velocity = new Vector3d(frame.releaseVelocity());
-
-        if (!velocity.isFinite()) {
+        if (this.releaseTicks <= 0) {
             return;
         }
 
-        final double speed = velocity.length();
+        this.releaseTicks--;
 
-        // A speed rail, in m/s. The acceleration clamp is the wrong unit for this.
-        if (speed > CfConfig.RELEASE_MAX_SPEED && speed > 1.0e-9) {
-            velocity.mul(CfConfig.RELEASE_MAX_SPEED / speed);
+        final double speed = relative.length();
+
+        if (speed < CfConfig.RELEASE_MIN_SPEED.get()) {
+            this.releaseTicks = 0;
+            return;
         }
 
-        final Vec3 own = player.getDeltaMovement();
+        final double decel = Math.min(
+                CfConfig.RELEASE_DECEL_G.get() * CfConfig.GRAVITY,
+                (speed - CfConfig.RELEASE_MIN_SPEED.get()) / CfConfig.TICK);
 
-        player.setDeltaMovement(
-                own.x + velocity.x / 20.0,
-                own.y + velocity.y / 20.0,
-                own.z + velocity.z / 20.0);
+        applied.fma(-decel / speed, relative);
 
-        player.fallDistance = 0.0f;
+        frame.state().released = true;
+    }
+
+    /** Runs the release damping out after the player has left the sub-level entirely. */
+    private void decayRelease(final Player player, final BodyFrame frame) {
+        frame.state().clear();
+
+        if (this.releaseTicks <= 0) {
+            return;
+        }
+
+        this.releaseTicks--;
+
+        final Vec3 velocity = player.getDeltaMovement();
+        final double speed = velocity.length() / CfConfig.TICK;
+
+        if (speed < CfConfig.RELEASE_MIN_SPEED.get()) {
+            this.releaseTicks = 0;
+            return;
+        }
+
+        final double decel = Math.min(
+                CfConfig.RELEASE_DECEL_G.get() * CfConfig.GRAVITY,
+                (speed - CfConfig.RELEASE_MIN_SPEED.get()) / CfConfig.TICK);
+
+        final double scale = decel * ACCEL_TO_DELTA / Math.max(1.0e-6, velocity.length());
+
+        player.setDeltaMovement(velocity.subtract(velocity.scale(scale)));
+
+        frame.state().released = true;
+    }
+
+    /**
+     * How hard the player is pushing into the surface, 0..1.
+     *
+     * <p>Holding a movement key is a claim that you are actively planted, and it buys real grip.
+     * That is a game-feel decision rather than a physical one, and it is the difference between a
+     * wall you can walk on and a wall you can only be pinned to.</p>
+     */
+    private static double brace(final Player player) {
+        final double forward = Math.abs(player.zza);
+        final double strafe = Math.abs(player.xxa);
+
+        return CfConfig.clamp01(Math.max(forward, strafe));
     }
 }
