@@ -51,15 +51,16 @@ typing a strength and getting no effect is not what anyone meant by it.
 
 /sable_cf centrifugal_force  enable | disable | <0..4>
 /sable_cf air_resistance     enable | disable | <0..4>
-/sable_cf grip               enable | disable | <0..4>
-/sable_cf slip               enable | disable | <0..2>
+/sable_cf grip               enable | disable | <0..8>
+/sable_cf wall               enable | disable | <0..2>
 /sable_cf camera             enable | disable | <0..2>
 /sable_cf hitbox             enable | disable | <0..1>
 /sable_cf release            enable | disable
+/sable_cf plane              enable | disable
 /sable_cf reset
 ```
 
-Everything else - Coriolis scale, brace bonus, attach thresholds, rim climb, camera shaping, arrow
+Everything else - Coriolis scale, brace bonus, press ramps, plane dwell, camera shaping, arrow
 scales - is in the config screen or `config/sable_cf-common.toml`. Live, no restart.
 
 `reset` reads defaults out of the config spec itself rather than from a list in the command code, so
@@ -71,226 +72,297 @@ Each knob answers a different question. Turn them in this order:
 
 | Knob | Question |
 | --- | --- |
-| `grip` | do I stand or slide |
-| `slip` | how fast do I creep outward |
-| `air_resistance` | when do I get swept off entirely |
+| `wall` | how much press does it take before I am a wall-walker |
+| `grip` | do I stand or slide once I am one |
+| `air_resistance` | how much does the wind drag me along the surface |
 | `centrifugal_force` | how strong is the ride at all |
-| `camera` | how much does the view lean |
+| `camera` | how much does the view follow |
 
-When something feels wrong in a way you cannot name, read **`share`** in the overlay first.
+When something feels wrong in a way you cannot name, read **`stick`** in the overlay first.
 
 ---
 
-## How it works
+## The model: wall-walking, not a force field
 
-### The one number that matters: `share`
+The mod has one idea in it. **Past enough centrifugal press you are standing on the wall** - hitbox
+and visual both - and the only thing that stops you simply welding yourself to it is air resistance.
 
-`share` is the fraction of the force pressing you into a surface that comes from **the ride** rather
-than from gravity or your own movement.
+Everything else follows from that sentence:
 
-It exists because the real failure mode of a mod like this is doing something when nothing is
-happening. A platform that is merely travelling - a lift, a ship under way - accelerates, wobbles,
-and delivers a pose over the network that is interpolated on arrival. Differentiate that pose twice
-and you get several m/s^2 of pure noise from a contraption doing nothing. Feed that into a tilt and a
-drag term and the player gets nudged and tipped while standing still on an ordinary moving deck.
+- if you are standing on the wall, gravity does not drag you along it, so the tangential load is
+  cancelled in proportion to how much of a wall-walker you are;
+- if you are standing on the wall, you have grip, so the wind has to beat friction before you move;
+- but the wind always gets a share, so on a 360 platform you creep - slowly, at a fixed terminal
+  speed, in a direction you can walk against. You can ride the loop all the way over; you just never
+  get to stand perfectly still while doing it.
 
-Three structural guards, not tuning values:
+One number expresses it: **`stick`**, 0 to 1.
 
-- **Frame acceleration is low-passed, then dead-zoned.** Below `FRAME_ACCEL_DEADZONE_G` (0.16 g) it
-  is exactly zero, faded in above so there is no step at the boundary. Nothing an ordinary platform
-  does reaches it.
-- **Tilt is gated on `share`, not on acceleration.** Gravity presses you down at 1 g on any deck;
-  only a ride adds to that. `share` near zero means no tilt whatever the raw numbers look like.
-- **Rotation-only features are gated on spin rate.** Wall attach, outward slip and rim climb do not
-  exist below `SPIN_DEADZONE` (0.15 rad/s). A lift cannot trip them however it is thrown about -
-  that is a property of the code, not a threshold someone picked.
+```
+stick = ramp(ride press, wall.min_press_g .. wall.full_press_g) * spin gate
+```
 
-On a plain moving sub-level `share` reads near zero, `contacts` finds the floor, and the arithmetic
-is identical to standing on the ground.
+`stick` is the single input to the hitbox angle, the camera angle and the force cancellation. They
+cannot disagree with each other, because they are three readings of one decision rather than three
+decisions that have to be kept in step. This is the structural change in this release: the previous
+build derived the body tilt, the camera target and the wall assist independently, which is why they
+drifted apart in corners and fought each other in transitions.
+
+### `stick` is deliberately hard to earn
+
+It is gated on **ride press only** - the press that the rotating frame is supplying, not the total
+press. Gravity pressing you into an ordinary floor produces exactly zero, at any strength, forever.
+That is why the mod does nothing at all on a static deck, and it is a property of the definition
+rather than of a threshold that could be mistuned.
+
+The spin gate multiplies it to zero below `spin.deadzone`, so a sub-level that merely translates -
+an airship, a lift, a train - can never produce it either.
+
+---
+
+## What is measured, and how
+
+### Frame kinematics
+
+`FrameKinematics` differentiates the sub-level's pose once, in the deck frame, and only once:
+
+- **omega** from the rotation between consecutive poses, converted through the quaternion logarithm
+  so a 359-degree step reads as -1 rather than +359;
+- **alpha** from the change in omega;
+- **linear acceleration** from the pivot's motion.
+
+The centripetal, Euler and Coriolis terms are then evaluated *analytically* from omega, alpha and
+your offset from the pivot.
+
+This is the fix for the lag you could see in the arrows. The old build computed the frame
+acceleration by **differentiating position twice** - and its velocity input was itself a backward
+difference, so the result was centred a tick and a half in the past and then rotated by the *current*
+pose, adding a further minus-delta-theta of yaw. At 2.5 rad/s that is 7 to 15 degrees of sideways
+error, which is exactly what "the arrows point a bit to the side" looks like. An analytic
+`omega x (omega x r)` has no lag by construction: it is evaluated at your position, this tick, from a
+quantity that only needed one derivative.
+
+`centrifugal_force.lead_ticks` compensates the remaining half-tick of filter delay. It defaults to 1.
 
 ### Contact detection
 
-Six probes, one per local axis of the sub-level, each querying real block shapes just outside the
-body. This replaced picking whichever of the six axes was most opposed to felt-down - a guess with no
-way of being wrong, because it always returned a surface. An airborne player got a phantom floor
-normal, a tilt, and a shove.
+Six thin slabs, one just outside each face of your oriented box, tested against real block collision
+shapes in the sub-level's own local coordinates. No raycast, no inference from felt-down. A face
+reports a contact when something solid is actually there.
 
-Because the probes are real contacts:
+### Plane commitment: hysteresis, not a blend
 
-- Detection is **not limited to the floor plane**; walls and ceilings are contacts like any other.
-- Simultaneous contacts blend (`SURFACE_BLEND_SHARPNESS`), so floor-to-wall inside a drum passes
-  through intermediate angles instead of snapping when a winner changes.
-- No contact means no normal, no press, no tilt. Being in the air is representable.
+The old build blended the six axis normals with a softmax. In a floor-wall corner that produces a
+**diagonal** normal that belongs to neither surface, and the wall assist then projected gravity onto
+it and pushed you up and sideways along it - the "it lifts me up" report, generated by an averaged
+normal that no real surface had.
 
-A raycast is not an option: hits against a sub-level come back in sub-level coordinates, millions of
-blocks away.
+A surface is now a discrete choice with hysteresis:
 
-### Air drag is deck-relative
+- one face is **committed** and is the floor;
+- a challenger must beat it by `plane.switch_margin_g` for `plane.dwell_ticks` consecutive ticks
+  before it takes over;
+- until then the committed face stays, unrotated and unblended.
+
+So the plane changes decisively or not at all. Corners resolve to one surface, transitions happen at
+a definite moment, and there is no orientation that averages two faces.
+
+The rotation for a committed face is `rotationTo(world up, normal)`, which is continuous through a
+full 360 loop - the axis flips sign exactly when the angle passes 180, and `Rz(-t)` and
+`Rz(360-t)` are the same rotation. The one degenerate case, a normal antiparallel to world up, is
+resolved with the previous tick's axis instead of an arbitrary one, so a loop does not roll the
+player sideways as it passes through inverted.
+
+---
+
+## Hitbox
+
+The body rotates towards `identity slerp plane, stick`, rate-limited by `hitbox.slew_deg_per_s` and
+smoothed with a half-life. The collision orientation is handed to Sable through
+`EntitySubLevelUtil.getCustomEntityOrientation`, which builds an oriented box and runs SAT against
+the sub-level's blocks.
+
+### Why it would not turn on a "solnyshko"
+
+The old gate was a product of three ramps, and one of them was `1 - feltUp.y` against a floor of
+0.04. On a big wheel at 1 rad/s and 5 m radius, felt-down deviates from true down by about 0.012 -
+**below the floor** - so the product was exactly zero and the hitbox never moved, no matter how
+obviously the world was rotating. The same gate also demanded 0.8 g of press before it started,
+which at the top of a loop means about 1.8 g of ride, since gravity is subtracting there.
+
+Both are gone. The hitbox follows `stick`, which is about press and spin - the two things that
+actually determine whether you are a wall-walker - and knows nothing about how far felt-down has
+moved. Full inversion works.
+
+The false positives on ordinary sub-levels came from the other end of the same expression: second
+derivatives of an interpolated network pose are noisy, and noise that clears a deadzone is
+indistinguishable from signal. With acceleration now analytic and the plane committed with dwell,
+there is nothing for the noise to trip.
+
+### The pivot, which is what was shaking you
+
+Sable rotates the oriented box about a point at **eye height**:
 
 ```
-air = (deck point velocity - sub-level rigid translation) + your own velocity - wind
+offset = (0, eyeHeight - ysize/2, 0)     // 0.72 for a standing player
+center.add(offset).sub(R.transform(offset))
 ```
 
-Subtracting the rigid translation is the whole fix for being swept off ordinary platforms. A deck
-cruising at 25 m/s is **not** a 25 m/s headwind for someone standing on it, and treating it as one is
-precisely what used to shove players around. What survives the subtraction is what should: the
-deck's **rotation** (omega x r) and your own walking. A spinner still tries to peel you off; a lift
-does nothing.
+The box centre therefore sweeps `2 * 0.72 * sin(A/2)`: 0.13 blocks at 10 degrees, **1.02 at 90**,
+1.44 at 180. That is a cartwheel, not a lean, and it swings the box straight into the surface it is
+leaning towards. Sable then resolves the penetration it just created, and its near-vertical branch
+redirects the whole MTV along the body up axis at full length:
 
-The law is superlinear (exponent 1.35), soft-capped near 2.2 g, rather than quadratic. Quadratic drag
-does nothing until a knee and then removes all control at once, which reads as "nothing, nothing,
-thrown off". At 1.35 there is a wide band where sliding is a state you can steer against for a few
-seconds - shifted toward gameplay, still honest that speed hurts.
+```
+if (dot > 0.8) { entityUp.mul(maxMTV.dot(entityUp), maxMTV).normalize(preLength); }
+```
 
-### Grip, slip and the drum
+A metre of penetration comes back as a metre-long shove pointing up and out, eight substeps per
+tick. That is the lifting and the shaking, and it was produced before any force in this mod was
+consulted - which is why no amount of tuning ever removed it.
 
-One Coulomb comparison, not a tree of thresholds: friction holds `grip * press`, and only the excess
-tangential load moves you. Stand, creep, slide, get swept - one formula, so transitions are
-continuous and "sliding" is a real state you can fight. Sneaking multiplies friction by
-`brace_bonus` (1.9), so resisting is a choice.
+`SubLevelEntityCollisionMixin` cancels that method, so the box rotates about its own centre. Checked
+against every use of the pivot in Sable: it is applied in exactly one place; the
+`fma(+eyeHeight, up_old)` / `fma(-eyeHeight, up_new)` pair inside the substep loop cancels exactly,
+because this mod returns one orientation for every partial tick; and `getFeetPos` is only consumed
+as a difference under the same rotation. Removing it is well-defined, and over a full 360 the
+accumulated displacement is **zero** - which is what makes the loop possible.
 
-On top of that, three things that exist only on a spinning ride:
+Compensating the player's position instead was considered and rejected: it needs
+`(I - R) * (0, eyeHeight, 0)`, between 1.02 and 2.29 blocks of real displacement, which moves the
+vanilla AABB, the render position and the position sent to the server. That trades a collision
+artefact for a desync.
 
-- **Outward slip.** A fraction (`slip`, 0.35) of the surface-tangential centrifugal load is let past
-  friction as deliberate creep, capped at `slip.max_speed` (3.2 m/s). In a drum you ease from the
-  middle out to the rim and end up leaning on the lip. Slow enough to walk against, so it reads as
-  pressure rather than a rail.
-- **Wall attach.** Touching a wall sideways latches you to it when the ride is genuinely pinning you:
-  `attach_press_g` (0.75 g) with hysteresis down to `release_press_g` (0.45 g), **and**
-  `attach_share` >= 0.6. The share test is the "only in the right scenarios" rule - a drum flinging
-  you outward passes it easily; running into a wall on a calm contraption cannot. Ordinary walls stay
-  ordinary and stay bounce-off-able. **Jumping always releases the latch**, unconditionally, so you
-  are never trapped in something you want out of.
-- **Rim climb.** Above `rim_climb_g` (1.35 g) an outward-facing obstruction becomes climbable at
-  `rim_climb_speed` (2.6 m/s), like a step. Explicitly **not** driven by the tilt of the physics -
-  being pressed into a wall hard enough to walk up it is a consequence of the press, which is also
-  why a rider in a real rotor can walk up the wall. Below the threshold the lip is a wall and stops
-  you.
+Set `hitbox.centre_pivot = false` to hand the pivot back to Sable; `Clearance` reads the same flag
+and will then test the eye-pivoted box, so the two stay consistent either way.
 
-`adhesion_g` (0.35) is small and does not hold you up - friction does. It exists because Sable
-resolves entity/sub-level contact in a limited number of substeps, so a body exactly touching a
-moving wall drifts a hair off it and back every tick, making "stuck to the drum" a coin flip.
-Raising it will not help you stick; it will only make letting go feel sticky.
+### Clearance
 
-### Hitbox
+Before a new hitbox orientation is published, twelve sample points of the rotated box are tested for
+free space. If the full step does not fit, half and quarter steps are tried.
 
-The mod supplies an **orientation** and nothing else, through Sable's own
-`getCustomEntityOrientation` hook. Sable builds an oriented box from the entity's unrotated size plus
-that quaternion and runs SAT against it.
+If none fit, **the previous orientation is kept**. The old build fell back to upright, which meant a
+tight spot produced tilt, reject, upright, tilt, reject - the buzz. Holding the last good pose
+instead means a blocked rotation is simply a pause, and the overlay says `BLOCKED` while it lasts.
 
-**There is no AABB inflation, and there should never have been.** An earlier version also overrode
-`Entity#makeBoundingBox` to fit the rotated box inside a wider axis-aligned one. That was wrong in
-both directions: Sable never consults the axis-aligned box for sub-level collision, so it bought
-nothing there, while vanilla collision *does*, so the widened box wedged players against ordinary
-main-level blocks in corridors. Rotating a body does not require making it bigger. The override is
-deleted.
+---
 
-Worth knowing, from reading Sable: it already expands its consideration bounds by `getEyeHeight()`
-and pivots the oriented box about eye height rather than the feet, and `collide()` early-returns for
-`ServerPlayer`.
+## Forces, friction and sliding
 
-**Partial tilt.** `tiltFromPress` is a smoothstep from `grip.min_press_g` (0.2) to
-`grip.full_press_g` (1.2), multiplied by a ride weight that is itself a smoothstep of `share` over
-0.15..0.6. Light press gives a slight lean toward the surface; full alignment needs real force. 1.2 g
-is reachable at ride speeds, not absurd ones - deliberately toward gameplay. `hitbox` scales the
-whole thing, down to 0 for camera-only.
+One solve, in this order, every tick:
 
-### Camera
+1. **Load** = ride + gravity + drag. Everything you can feel, in one vector.
+2. **Stick cancels** its share of the tangential part, and its share of any outward normal part.
+3. **Friction** holds what it can: `grip.strength * press * footing`, with a bonus while you are
+   pushing into the surface. Under budget nothing moves; over budget only the excess gets through.
+4. **The excess is opposed by a viscous term**, so a slide accelerates, settles at a terminal speed
+   and stops accelerating.
+5. **Air's share bypasses friction** entirely, paired with damping sized so the drift settles at
+   `air_resistance.slide_max_speed`.
+6. Gravity is subtracted at the end, because Minecraft already applied it.
 
-Registered as an ACS `TiltSource` at priority 100. The target is the **felt** down direction, not the
-deck plane - that single substitution is what makes a level deck do nothing, a slope look like a
-slope, and a fast drum carry you round.
+Step 6 gives the correctness test the whole file is built around: **on a stationary deck the applied
+vector is exactly zero.** No ride, no stick, nothing cancelled, load is gravity, gravity minus
+gravity is nothing. The mod cannot perturb ordinary play - not because the thresholds are high, but
+because there is nothing for it to add.
 
-The chain, in order, exists to be gentle without being dead:
+### Why sliding was unpleasant before
 
-1. **Low-pass on the target** (`smoothing`, 0.12 s half-life) - removes pose noise before it can
-   become motion.
-2. **Dead-band** (`deadband_deg`, 0.7 degrees) - slop, so micro-jitter produces literally no camera
-   movement rather than a small amount of constant movement. This is what kills the shakes.
-3. **Spring** on the rotation vector (`response` 4.5, `damping` 1.05) - near-critically damped:
-   fastest approach with no overshoot, which is the mathematical answer to "snappy and smooth at the
-   same time".
-4. **Jolt boost** - `gain * x / (1 + x)`, monotonic and bounded, where `x` mixes the turn rate of the
-   felt-up direction with angular acceleration. So changes of direction are *felt* - stiffer spring
-   for the moment of the turn - but the response cannot spike. The old trigger was omega^2 * r, which
-   grows with radius and with steady rotation, so standing on the rim gave a big number while nothing
-   was happening and a sharp flick near the axis gave a small one. That was the instability.
-5. **Loop suppression** (0.85) - full flips fall back to a running mean of felt-up over the rotation
-   period, so the centrifugal part cancels across a revolution and the camera stops rolling with a
-   360.
-6. **Walk damping** (0.6) and full removal of the Coriolis term - Coriolis is the only component
-   generated by *your* movement rather than the ride, so simply walking on a spinning deck no longer
-   tips the view. "Walking" and "holding a bank" are damped separately.
-7. **Pitch response** 0.45, **deck lean** 0.2, max tilt 65 degrees, slew 200 deg/s. Pitch is the
-   nauseating channel and is damped harder than roll; yaw is discarded entirely. `deck_lean` is a
-   pinch of the actual surface normal as proprioception - at 1.0 it would reproduce exactly the
-   deck-locked feel this was built to avoid.
+Three separate reasons, all removed by folding the three solvers into one:
 
-Note for anyone extending this: **never call `AcsHandle#state()` inside a `TiltSource`** - it
-re-enters the source and stack-overflows.
+- **The slide solver never saw gravity.** It considered only the fictitious forces; tangential
+  gravity was handled by a different subsystem. So the thing pulling you down the wall and the thing
+  deciding whether you slid were not the same calculation.
+- **The excess was clipped, not damped.** `(limit - already) / limit` scales the acceleration but
+  leaves it positive forever, so a slide kept gaining speed for as long as the load was over budget.
+  It never converged, so it never read as sliding - only as losing control.
+- **`grip` was a gate.** At 3 it closed completely and sliding disappeared rather than reduced.
+  Grip is now a threshold that the load is measured against, with the remainder passed on, so higher
+  grip makes slides slower and never absent.
 
-### Launch through the centre
+### Adhesion at the top of a loop
 
-Optional (`release`, on by default). If a contraption is carrying you upward and the sub-level itself
-is suddenly stopped - it catches on a frame, hits a ceiling - you keep going and fly out through the
-opening.
+When the load is pulling you off the surface, `stick` supplies the press for the friction budget
+instead. Without that clause, hanging upside down would come with zero grip - attached, but sliding
+sideways off the deck.
 
-Detection uses the **raw**, unfiltered frame acceleration (this is the one place where the sharp
-signal is the point): deceleration along the direction of travel above `decel_g` (9.0) while moving
-faster than `min_speed` (3.5 m/s). It fires **only if you were already attached or gripped**, with a
-10-tick cooldown. So it cannot turn into bouncing off every contraption you brush against - if the
-ride never had hold of you, there is nothing to be released from.
+---
 
-### Debug overlay
+## Camera
 
-`/sable_cf debug_overlay`. Billboard arrows with flat 2D triangular heads - velocity, centrifugal,
-drag, felt-down, surface normal - plus a text block.
+Target is the committed plane, scaled by `stick`, plus a small capped lean towards felt-down.
+Because the target is a committed plane it is a step function: it does not wobble when the forces
+wobble, so there is nothing for the smoothing to chase.
 
-Three length bands: below the deadzone there is no arrow at all, above it never shorter than
-`min_length` (0.28), then length follows magnitude up to `max_length` (3.5). Smoothing is on the raw
-physics vectors with a 70 ms half-life on real time, so thresholds are in m/s and g rather than in
-pixels. Alpha comes from `debug.alpha` (0.7); `debugQuads` already carries translucent transparency.
+`TiltSpring` is a critically damped second-order spring on the rotation vector, substepped so it
+behaves the same at 30 and 300 fps, and rate-limited so a contraption that snaps 180 degrees in a
+tick cannot do the same to your head.
 
-Geometry is biased toward the camera (`CAMERA_BIAS` 0.35) so arrows draw over the player model.
-**Honest limit:** world geometry still occludes them. Real depth-test-off needs `RenderType.create`,
-which is `protected static` and therefore an access transformer; `RenderSystem.disableDepthTest()` by
-hand does not survive, because the render type reinstates its own depth shard in
-`setupRenderState()` when the batch flushes.
+The old camera was an exponential low-pass with a dead band in front. Both halves are why it felt
+wrong: a low-pass is fastest when the target moves and slowest as it arrives, the opposite of how a
+head moves; and the dead band held the camera still until the error crossed a threshold and then
+released it in one lump. A spring has momentum - it leans out ahead and arrives with its velocity
+already decaying. There is no dead band at all, because a critically damped spring is already still
+when its error is small.
 
-The HUD's most useful lines are `press / hold / load` - you can watch load cross hold at the instant
-you start sliding - and `share / contacts / attached`.
+`camera.lead_seconds` aims a fixed time ahead of where the target is going, which cancels most of
+the residual lag without buying the overshoot that lowering the damping would.
+`camera.pitch_response` takes a share off the vertical component only - applied to the spring's
+error rather than its output, so it stays critically damped instead of permanently fighting a
+scaled-down result.
+
+**ACS is required for the camera** and for nothing else. Without it the physics, the rotated hitbox
+and the overlay all work; the view simply stays level. Winning an ACS frame means owning the
+crosshair, the reach rays, projectile direction and what the server is told, so the source declines
+every frame it has nothing to say about - and keeps claiming while the spring unwinds, because
+letting go mid-lean would hand ACS a camera halfway over.
+
+---
+
+## Debug overlay
+
+`/sable_cf debug_overlay` - arrows in the world, numbers in the corner.
+
+| Arrow | Colour |
+| --- | --- |
+| air velocity | white |
+| centrifugal | orange |
+| drag | blue |
+| apparent (felt-down) | violet |
+| plane normal | green |
+
+The numbers to read, in order:
+
+- **`stick`** - how much of a wall-walker you are. If this is 0, nothing this mod does is visible,
+  so whatever is moving you is not this mod.
+- **`press` / `hold` / `load`** - friction can hold `hold`, something is pushing with `load`. The
+  moment load passes hold you start moving, and you can watch it happen.
+- **`plane`** - which face is committed, and which is challenging it and for how many ticks. A
+  challenger that never reaches the dwell count is hysteresis doing its job.
+- **`body` / `hitbox`** - the two angles should track. A persistent gap plus `BLOCKED` means the
+  rotation did not fit and is waiting.
+
+Arrow smoothing runs on wall-clock time, so it looks the same at any frame rate.
 
 ---
 
 ## Known limits
 
-- **Eye position does not shift along body-up.** Lying against a drum wall the camera sits slightly
-  inside the body. Needs an upstream hook.
-- **The player model does not rotate** - only the collision box and the camera. Sable's renderer
-  applies yaw only.
-- **Sable resolves collision in a limited number of substeps** (about 8 for the local player), so
-  above roughly 20 m/s of relative surface speed contacts get unreliable and tunnelling is possible.
-  This is upstream, not this mod. Practical consequence: build a **large** ride at moderate rpm
-  rather than a small drum at insane rpm.
-- **Gravity here is 32 m/s^2**, Minecraft's own, not 9.81. Every `g` in the config and overlay uses
-  that; mixing in SI would make all the thresholds read wrong.
-- **Fall damage is the server's opinion.** The mod clears client `fallDistance` above 1.5 g of press,
-  but the server keeps its own count from position deltas. For testing rides:
-  `/gamerule fallDamage false`.
-- **The camera needs the unreleased ACS API.** Without `libs/aero_cam_sync*.jar` the build fails on
-  `CfTiltSource`; at runtime against released 1.3.7 the bridge catches `LinkageError`, logs, and
-  disables the camera while physics and arrows keep working.
-- **Sure Footing is untouched** - no compile dependency, no calls. It already keeps your jump arc in
-  the sub-level frame, which is exactly the half of the job it should own; duplicating it would count
-  the impulse twice. Likewise Sable already supplies inherited velocity on release, so the mod does
-  not add deck velocity by hand.
-
-The only two places touching Sable internals are collected in `compat/SableAccess.java` - one file to
-fix when Sable moves. That is also why the dependency is pinned to `[2.0.0,2.1)` rather than open.
+- **Client-authoritative.** Forces are applied on the client that owns the player. A server that
+  runs strict movement checks will disagree with a player being held to a wall.
+- **Shape detail.** A probe hit on a slab or a stair is treated as an axis-aligned face. Sable
+  computes the true contact normal internally; see `docs/UPSTREAM.md`.
+- **One sub-level at a time.** The frame tracks whichever sub-level Sable says you are on.
+- **Angular velocity is differentiated, not read.** Sable has the networked value and keeps it
+  private, so a small filter delay remains; `centrifugal_force.lead_ticks` compensates for it.
+- **The pivot fix is a mixin.** If Sable refactors `transformEntityBoundsCenter` the injection
+  quietly does not apply (`defaultRequire: 0`) and the old pivot returns; turn `hitbox.max_deg` down
+  if that happens.
 
 ---
 
 ## Upstream
 
-`docs/UPSTREAM.md` holds the requests for Sable, Sure Footing and ACS, each with the reasoning and
-the code path that forced it - ready to paste into an issue.
+See `docs/UPSTREAM.md`. Six requests, each with the code path that forced it - the two that would
+remove code from this mod entirely are an orientation provider registry in Sable, and making the
+collision-box pivot configurable.
