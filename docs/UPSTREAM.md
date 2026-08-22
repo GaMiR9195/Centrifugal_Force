@@ -1,117 +1,100 @@
-# Upstream API asks
+# Upstream requests
 
-Things `sable_cf` currently works around, in rough order of how much difference they would make.
-Each one is small on the upstream side and removes a workaround - or, in the first case, unlocks a
-feature that cannot be built from outside at all.
-
----
-
-## 1. Sable - finish wiring `getCustomEntityOrientation`
-
-**Where:** `dev.ryanhcode.sable.api.entity.EntitySubLevelUtil`
-
-Both of these are stubs in 2.0.3:
-
-```java
-public static Quaterniondc getCustomEntityOrientation(Entity entity) { return null; }
-public static boolean hasCustomEntityOrientation(Entity entity)      { return false; }
-```
-
-The shape is already exactly right - there is just nothing behind it. A provider registry would do
-it:
-
-```java
-public static void registerOrientationProvider(Function<Entity, Quaterniondc> provider);
-```
-
-**Why it matters:** this is the only route to rotating a player's hitbox and model with the
-sub-level. Without it, an upright AABB cannot fit through a doorway on a rolled deck, and "walking
-around inside a rotating drum" stays an approximation. It is also the one thing on this list that no
-amount of external code can substitute for. (Worth saying clearly: **ACS does not do this either.**
-ACS rotates the camera and corrects rays; the hitbox, the model and the server's opinion all stay
-vanilla. It is a common misreading of what camera sync provides.)
+This mod would rather call an API than mix in. Two mixins remain, and each maps to one small change
+upstream. Written to be pasteable into an issue.
 
 ---
 
-## 2. Sable - expose the contact normal
+## Sable
 
-**Where:** `EntityMovementExtension#sable$getCollisionInfo()`, `@ApiStatus.Internal`
+### 1. `hasCustomEntityOrientation` and `getCustomEntityOrientation` contradict each other
 
-Sable already computes a real contact manifold against sub-level geometry. From outside, the best
-available substitute is to take the sub-level's six local axes, pick whichever is most opposed to
-felt gravity, and confirm contact from `onGround`/`horizontalCollision`/`verticalCollision`.
-
-That is exact for flat block faces and completely wrong for slabs, stairs and anything sloped.
-A read-only public accessor - even just the normal - would fix it:
+`EntitySubLevelUtil.getCustomEntityOrientation` is the natural hook for an entity that should be
+oriented by something other than the sub-level's own pose, and `mixin/entity/entities_turn_with_sub_levels/GameRendererMixin`
+reads it. But the guard around that call is:
 
 ```java
-public static Vec3 getContactNormal(Entity entity); // null when not in contact
+if (standingSubLevel != null && player.getVehicle() == null && !standingSubLevel.isRemoved()
+        && !EntitySubLevelUtil.hasCustomEntityOrientation(player)) {
+    final Quaterniondc customOrientation = EntitySubLevelUtil.getCustomEntityOrientation(player, 1.0f);
+    ...
+}
 ```
 
-A raycast is not a workaround here: hits on sub-level blocks come back in the sub-level's own
-coordinate space, millions of blocks from the player, so every result needs converting and
-disambiguating first.
+So `hasCustomEntityOrientation` returning `true` disables the entire block, including the call to
+`getCustomEntityOrientation` - the two methods cannot both be answered honestly. Anyone supplying a
+custom orientation has to override the getter while leaving the predicate returning `false`, which
+reads like a bug even though it is the only thing that works.
+
+**Ask:** either let a provider return a non-null orientation with the predicate returning `true`, or
+drop the predicate from the guard. Both currently return constants (`null` / `false`), so this is a
+free change.
+
+**Better ask:** a small registration surface, so no mixin is needed at all:
+
+```java
+EntitySubLevelUtil.registerOrientationProvider((entity, partialTicks) -> quaternionOrNull);
+```
+
+### 2. The contact manifold is `@ApiStatus.Internal`
+
+`EntityMovementExtension#sable$getCollisionInfo()` is exactly what a mod needs to know *which*
+surface an entity is resting against, and it is marked internal. Without it, the surface normal has
+to be re-derived by testing the six deck axes against felt-down and blending them (`SurfaceEstimator`
+here) - which works, and even has the pleasant side effect of a smooth floor-to-wall transition, but
+it is a reconstruction of information Sable already has exactly.
+
+**Ask:** a read-only accessor for the resting surface normal, or a supported view of the manifold.
+
+### 3. Eye position is not offset along the body's up axis
+
+With a rotated hitbox, the eye should sit along the body's own up axis rather than at vanilla eye
+height on the world's Y. Vanilla computes eye position in several places, and patching all of them
+from a downstream mod means either a broad mixin or a visible discrepancy. This mod currently accepts
+the discrepancy: lying against a drum wall, the camera is slightly inside the body.
+
+**Ask:** route eye position through one overridable point, or offer
+`EntitySubLevelUtil.getCustomEyeOffset(entity, partialTicks)` alongside the orientation hook.
+
+### 4. Collision testing against an oriented box
+
+The deepest version of the same request. `Entity#makeBoundingBox` is mixed in here to re-fit a
+rotated OBB to an AABB, which necessarily inflates it - at 45 degrees a 0.6 x 1.8 player needs about
+1.7 blocks of width, enough to wedge in a one-block corridor. Sable already does oriented collision
+work against sub-level geometry internally.
+
+**Ask:** let an entity declare a body orientation that Sable's collision path uses directly, instead
+of every downstream mod approximating it with an inflated AABB.
 
 ---
 
-## 3. Sable - client-side angular velocity
+## Aeronautics Camera Sync
 
-**Where:** `ClientSubLevel.latestNetworkedAngularVelocity` (private), `RigidBodyHandle` (server only)
+### 5. Release `addTiltSource`
 
-Sable knows the angular velocity on both sides but exposes it on neither, so this mod differences
-`logicalPose().orientation()` against `lastPose().orientation()` every tick and converts to
-axis-angle. That works - it is what Sable's own client `getVelocity()` does for the linear case -
-but it needs a near-identity guard to avoid a divide-by-zero NaN, needs an angle wrap past pi to
-avoid reading a fast flip as a backwards spin, and it cannot see angular *acceleration* except as a
-noisy second difference.
+`AcsHandle#addTiltSource(int priority, TiltSource)` exists on `api-beta` but not in `1.3.7`. It is
+the correct extension point and it works well - priority ordering, `appliesTo` gating, `tiltScale()`
+applied for free - so the only problem is that using it means asking people to build a branch.
 
-Mirroring the existing point-velocity helper would cover it:
+**Ask:** ship it in a release. Nothing else is needed.
 
-```java
-Vector3dc getAngularVelocity(Level level, SubLevelAccess subLevel); // rad/s, world space
-```
+Two notes from using it, both worth documenting rather than changing:
 
----
-
-## 4. Sure Footing - a way to end a carry
-
-**Where:** `JumpCarryHandler`
-
-Sure Footing re-asserts the tracking sub-level every tick while you are airborne, and only lets go
-on `onGround` or past `exit_distance_blocks`. When a spinner flings you off at speed, the right
-behaviour is to leave the frame *immediately* - continuing to rotate the velocity vector with a drum
-you are no longer touching sends you somewhere strange.
-
-The only lever available from outside is to null Sable's tracking sub-level ourselves, which is a
-write into state Sure Footing also writes, in the same tick phase, where the winner depends on
-handler registration order. It is off by default here for that reason.
-
-A one-liner solves it:
-
-```java
-public static void releaseCarry(Player player); // stop carrying, do not re-acquire this tick
-```
-
-A `canCarry` veto hook would work just as well.
+- `AcsHandle#state()` must not be called from inside a `TiltSource`, since `state()` polls the
+  sources. It is a straightforward infinite recursion and the fix is to read everything from
+  `TiltContext` - which already carries what is needed. Worth a line in `docs/API.md`.
+- `TiltContext#deltaTicks()` being realtime rather than tick-quantised is what makes a framerate
+  independent spring possible. Please keep it.
 
 ---
 
-## 5. ACS - release `addTiltSource` 
+## Minecraft / NeoForge
 
-**Where:** `com.playsi.aero_cam_sync.api.AcsHandle`
+### 6. `RenderType.create` is `protected static`
 
-`addTiltSource(int priority, TiltSource)` is on the `api-beta` branch but not in the published
-1.3.7, which only has `addListener` and `addPolicy` - neither of which can supply a tilt. So the
-camera half of this mod cannot compile against any released ACS, and users have to build a jar from
-a branch.
-
-The API itself is genuinely well designed for this: highest-priority source that claims the frame
-owns the camera, the aim rays, the projectiles and the server's copy, all at once. It just needs to
-ship.
-
-Small notes from using it:
-
-- Calling `AcsHandle#state()` from inside a `TiltSource` recurses forever. The javadoc says so;
-  it might be worth a guard that throws something legible instead.
-- `TiltContext#deltaTicks()` being realtime rather than game time is the right call and is what makes
-  framerate-independent smoothing possible inside a source. Worth keeping prominent in the docs.
+Not a request, a note on why this mod's debug arrows do not draw through terrain. Building a render
+type with `NO_DEPTH_TEST` needs `RenderType.create`, which requires an access transformer, and
+setting `RenderSystem.disableDepthTest()` by hand does not work because a render type re-applies its
+own depth shard in `setupRenderState()` when the batch is flushed. The arrows are biased towards the
+camera instead, which puts them in front of the player model - the actual complaint - and world
+geometry still occludes them. If the overlay ever becomes more than a debug aid, add the AT.
