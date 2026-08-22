@@ -20,21 +20,20 @@ import java.util.Locale;
 /**
  * {@code /sable_cf}.
  *
- * <h2>One knob per subsystem</h2>
+ * <h2>One knob per subsystem, and each one does what its name says</h2>
  *
  * <p>Every force takes its strength directly - {@code /sable_cf air_resistance 1.4} - with no
- * sub-parameter to discover and no second number to combine with it mentally. The shaping constants
- * that used to be exposed as {@code reference_speed} still exist, but they are fixed in
- * {@link CfConfig} where they can be read once rather than tuned forever. A knob you have to
- * combine with another knob in your head is not a knob you can tune.</p>
+ * sub-parameter to discover. The shaping constants live in {@link CfConfig} where they can be read
+ * once rather than tuned forever.</p>
  *
- * <p>Passing a value also enables the subsystem, because typing a strength and getting no effect is
- * never what anyone meant by it.</p>
+ * <p>{@code slip} is gone, and its absence is the point. It was half of {@code air_resistance}
+ * under a second name: the outward creep that walks you to the rim of a drum is the same idea as
+ * the headwind that drags you off one, so having them on separate switches meant turning air
+ * resistance off did not stop you sliding. That is now {@code air_resistance}'s own {@code slide}.
+ * The other thing {@code slip} controlled - climbing a wall the ride pins you to - is the opposite
+ * force, the one that keeps you on, and it is {@code /sable_cf wall}.</p>
  *
  * <h2>Colour convention, applied everywhere</h2>
- *
- * <p>Labels are grey and values are coloured, always the same way, so the display can be read at a
- * glance while you are being flung around rather than parsed:</p>
  *
  * <ul>
  *   <li><b>green</b> on, holding, fine - <b>dark grey</b> off or absent</li>
@@ -43,8 +42,7 @@ import java.util.Locale;
  *   <li><b>aqua</b> a number you set, so a configured value is never confused with a measured one</li>
  * </ul>
  *
- * <p>No column padding. Values sit one space after their label; runs of spaces used as alignment
- * are what made the old output hard to read in a chat window that is already narrow.</p>
+ * <p>No column padding. Values sit one space after their label.</p>
  */
 public final class CfCommands {
 
@@ -76,9 +74,9 @@ public final class CfCommands {
                 .then(knob("air_resistance", CfConfig.AIR_ENABLED,
                         CfConfig.AIR_STRENGTH, 0.0, 4.0))
                 .then(knob("grip", CfConfig.GRIP_ENABLED,
-                        CfConfig.GRIP_STRENGTH, 0.0, 4.0))
-                .then(knob("slip", CfConfig.SLIP_ENABLED,
-                        CfConfig.SLIP_STRENGTH, 0.0, 2.0))
+                        CfConfig.GRIP_STRENGTH, 0.0, 8.0))
+                .then(knob("wall", CfConfig.WALL_ENABLED,
+                        CfConfig.WALL_STRENGTH, 0.0, 2.0))
                 .then(knob("camera", CfConfig.CAMERA_ENABLED,
                         CfConfig.CAMERA_AMOUNT, 0.0, 2.0))
                 .then(knob("hitbox", CfConfig.HITBOX_ENABLED,
@@ -173,10 +171,8 @@ public final class CfCommands {
     /**
      * Restores every value the commands can touch.
      *
-     * <p>Reads each default from the config spec rather than from a list written out here. The list
-     * that used to live in this method had already drifted - it was resetting the camera response to
-     * 9.0 after the default became 4.5, so "reset" quietly moved you further from the tuned
-     * behaviour than where you started. A default belongs in exactly one place.</p>
+     * <p>Reads each default from the config spec rather than from a list written out here, because
+     * a list written out here had already drifted once.</p>
      */
     private static int reset(final CommandContext<CommandSourceStack> context) {
         restore(CfConfig.CENTRIFUGAL_ENABLED);
@@ -186,22 +182,24 @@ public final class CfCommands {
 
         restore(CfConfig.AIR_ENABLED);
         restore(CfConfig.AIR_STRENGTH);
+        restore(CfConfig.AIR_SLIDE);
+        restore(CfConfig.AIR_SLIDE_MAX_SPEED);
 
         restore(CfConfig.GRIP_ENABLED);
         restore(CfConfig.GRIP_STRENGTH);
         restore(CfConfig.GRIP_BRACE_BONUS);
         restore(CfConfig.GRIP_MIN_PRESS_G);
         restore(CfConfig.GRIP_FULL_PRESS_G);
+        restore(CfConfig.GRIP_SLIDE_CAP_G);
         restore(CfConfig.ATTACH_PRESS_G);
         restore(CfConfig.ATTACH_RELEASE_G);
         restore(CfConfig.ATTACH_SHARE);
         restore(CfConfig.ATTACH_ADHESION_G);
 
-        restore(CfConfig.SLIP_ENABLED);
-        restore(CfConfig.SLIP_STRENGTH);
-        restore(CfConfig.SLIP_MAX_SPEED);
-        restore(CfConfig.RIM_CLIMB_G);
-        restore(CfConfig.RIM_CLIMB_SPEED);
+        restore(CfConfig.WALL_ENABLED);
+        restore(CfConfig.WALL_STRENGTH);
+        restore(CfConfig.WALL_PRESS_G);
+        restore(CfConfig.WALL_MAX_SPEED);
 
         restore(CfConfig.RELEASE_ENABLED);
         restore(CfConfig.RELEASE_DECEL_G);
@@ -209,9 +207,12 @@ public final class CfCommands {
 
         restore(CfConfig.HITBOX_ENABLED);
         restore(CfConfig.HITBOX_AMOUNT);
+        restore(CfConfig.HITBOX_MAX_DEG);
 
         restore(CfConfig.CAMERA_ENABLED);
         restore(CfConfig.CAMERA_AMOUNT);
+        restore(CfConfig.CAMERA_LEAN);
+        restore(CfConfig.CAMERA_LEAN_MAX_DEG);
         restore(CfConfig.CAMERA_RESPONSE);
         restore(CfConfig.CAMERA_DAMPING);
         restore(CfConfig.CAMERA_SMOOTHING);
@@ -251,7 +252,7 @@ public final class CfCommands {
                 describe("centrifugal", CfConfig.CENTRIFUGAL_ENABLED, CfConfig.CENTRIFUGAL_STRENGTH),
                 describe("air", CfConfig.AIR_ENABLED, CfConfig.AIR_STRENGTH),
                 describe("grip", CfConfig.GRIP_ENABLED, CfConfig.GRIP_STRENGTH),
-                describe("slip", CfConfig.SLIP_ENABLED, CfConfig.SLIP_STRENGTH)));
+                describe("wall", CfConfig.WALL_ENABLED, CfConfig.WALL_STRENGTH)));
 
         reply(context, join(
                 describe("camera", CfConfig.CAMERA_ENABLED, CfConfig.CAMERA_AMOUNT),
