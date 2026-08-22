@@ -1,91 +1,134 @@
 package dev.gamir.sable_cf.client;
 
-import dev.gamir.sable_cf.CfConfig;
 import dev.gamir.sable_cf.physics.CfMath;
 import org.joml.Quaternionf;
+import org.joml.Quaternionfc;
 import org.joml.Vector3f;
 
 /**
- * A second-order spring on a rotation, integrated in rotation-vector space.
+ * A critically damped rotational spring. This is the whole of the camera's feel.
  *
- * <p>Not a lerp. An exponential lerp towards a target has no momentum, so it is either sluggish or
- * twitchy and there is no setting in between - which is exactly the trade "snappy but smooth"
- * refuses to accept. A damped spring has both a stiffness and a damping ratio, and at a damping
- * ratio of 1 (critical) it gives the fastest possible approach with mathematically zero overshoot.
- * That is the actual definition of crisp without wobble.</p>
+ * <h2>Why a spring and not smoothing</h2>
  *
- * <p>Integrated in sub-steps of at most 1/60 s so that a frame spike cannot make the explicit
- * integrator ring, and the angular velocity is clamped so a contraption that snaps 180 degrees in
- * one tick makes the camera lean over rather than whip.</p>
+ * <p>The old camera was an exponential low-pass with a dead band in front of it, and both halves
+ * of that are why it was reported as uncomfortable. A low-pass has no momentum, so it is fastest
+ * at the moment the target moves and slowest as it arrives - the exact opposite of how a head
+ * moves, and the reason it read as "laggy then sudden". The dead band then held the camera
+ * perfectly still until the error crossed a threshold and released it all at once, which turns a
+ * smooth ramp into a series of small jerks.</p>
  *
- * <h2>Why the parameters are arguments now</h2>
+ * <p>A second-order spring has momentum. It leans out ahead, arrives with its velocity already
+ * decaying, and settles without overshooting - which is what "lively but pleasantly interpolated"
+ * means in practice. Response sets how quickly, damping sets whether it overshoots, and the two
+ * are independent, so the camera can be made snappier without also being made bouncy. There is no
+ * dead band at all: a critically damped spring is already still when its error is small.</p>
  *
- * <p>Stiffness and damping used to be read from the config in here, which meant every situation got
- * the same spring. That is what made sharp manoeuvres unpredictable: a spring tuned to be calm
- * enough for walking is too slow for a flick, and one tuned for a flick jitters when you walk.
- * {@link CfTiltSource} now decides both per frame - stiffer for a sharp manoeuvre, better damped
- * while walking - and this class just integrates honestly.</p>
+ * <h2>Rotation vectors, and why the maths has to be done in them</h2>
+ *
+ * <p>Springs need addition and scaling, and quaternions have neither. Everything below runs on the
+ * logarithm - axis times angle - where {@code error * k} and {@code velocity + accel * dt} mean
+ * what they look like, and only the final step exponentiates back. {@link CfMath#log} takes the
+ * short way round, so the camera never rolls 350 degrees to avoid rolling 10.</p>
+ *
+ * <h2>Substepping</h2>
+ *
+ * <p>An explicit integrator with a stiff spring goes unstable when the timestep gets long, and
+ * frame times are not something a mod gets to choose - one 200 ms hitch would otherwise leave the
+ * camera spinning. The step is subdivided so behaviour is identical at 30 fps and at 300, which is
+ * also what the ACS docs ask of a source.</p>
  */
 public final class TiltSpring {
 
-    private static final float MAX_SUB_STEP = 1.0f / 60.0f;
+    /** Longest integration step, seconds. Beyond this a stiff spring stops being stable. */
+    private static final float MAX_SUB_STEP = 1.0f / 120.0f;
 
+    /** Below this the spring is at rest and the camera can be handed back. */
     private static final float RESIDUAL_EPSILON = 1.0e-3f;
 
     private final Quaternionf current = new Quaternionf();
-    private final Vector3f angularVelocity = new Vector3f();
 
-    /**
-     * @param naturalFrequency stiffness, rad/s
-     * @param dampingRatio     1 is critical: fastest approach with no overshoot
-     */
-    public Quaternionf step(
-            final Quaternionf target,
-            final float deltaTicks,
-            final float naturalFrequency,
-            final float dampingRatio) {
+    /** Angular velocity as a rotation vector, world frame, rad/s. */
+    private final Vector3f velocity = new Vector3f();
 
-        // Clamped: a loading hitch must not be integrated as a real second of motion.
-        float remaining = Math.min(Math.max(deltaTicks, 0.0f), 4.0f) / 20.0f;
+    private final Quaternionf scratch = new Quaternionf();
+    private final Vector3f error = new Vector3f();
+    private final Vector3f step = new Vector3f();
 
-        if (remaining <= 0.0f || !Float.isFinite(remaining)) {
-            return new Quaternionf(this.current);
-        }
-
-        final float frequency = Math.min(Math.max(naturalFrequency, 0.5f), 60.0f);
-        final float damping = Math.min(Math.max(dampingRatio, 0.2f), 4.0f);
-        final float slew = (float) Math.toRadians(CfConfig.CAMERA_SLEW_DEG_PER_S.get());
-
-        while (remaining > 0.0f) {
-            final float dt = Math.min(remaining, MAX_SUB_STEP);
-            remaining -= dt;
-
-            // The rotation that takes current to target, as a plain 3-vector.
-            final Vector3f error = CfMath.log(
-                    new Quaternionf(target).mul(new Quaternionf(this.current).invert()));
-
-            final Vector3f acceleration = new Vector3f(error).mul(frequency * frequency)
-                    .sub(new Vector3f(this.angularVelocity).mul(2.0f * damping * frequency));
-
-            this.angularVelocity.add(acceleration.mul(dt));
-            CfMath.clampAngle(this.angularVelocity, slew);
-
-            if (!this.angularVelocity.isFinite()) {
-                this.angularVelocity.zero();
-                this.current.identity();
-                break;
-            }
-
-            this.current.set(CfMath.exp(new Vector3f(this.angularVelocity).mul(dt)).mul(this.current))
-                    .normalize();
-        }
-
-        return new Quaternionf(this.current);
+    public void reset() {
+        this.current.identity();
+        this.velocity.zero();
     }
 
-    /** True while there is still tilt or motion left to unwind. */
-    public boolean hasResidual() {
-        return CfMath.log(this.current).length() > RESIDUAL_EPSILON
-                || this.angularVelocity.length() > RESIDUAL_EPSILON;
+    /**
+     * Integrates towards {@code target} for {@code dt} seconds.
+     *
+     * @param response  natural frequency, rad/s. Higher is snappier.
+     * @param damping   1.0 is critical. Below overshoots, above crawls in.
+     * @param maxRate   hard ceiling on turn rate, rad/s. The one thing that is not negotiable -
+     *                  it is what guarantees a contraption that snaps 180 degrees in a tick cannot
+     *                  do the same to the player's head.
+     * @param pitchAxis unit axis that counts as pitch, or null for none.
+     * @param pitchGain how much of the pitch component of the error to act on, 0..1.
+     */
+    public Quaternionf advance(final Quaternionfc target, final float dt,
+                                final float response, final float damping, final float maxRate,
+                                final Vector3f pitchAxis, final float pitchGain) {
+
+        if (!(dt > 0.0f) || !Float.isFinite(dt)) {
+            return this.current;
+        }
+
+        final int steps = Math.max(1, Math.min(16, (int) Math.ceil(dt / MAX_SUB_STEP)));
+        final float sub = dt / steps;
+
+        final float omega = Math.max(0.1f, response);
+        final float zeta = Math.max(0.05f, damping);
+
+        for (int i = 0; i < steps; i++) {
+            // error = log(target * current^-1), i.e. the world-frame turn still to be made.
+            this.scratch.set(this.current).conjugate().premul(target);
+
+            this.error.set(CfMath.log(this.scratch));
+
+            if (!this.error.isFinite()) {
+                this.error.zero();
+            }
+
+            // Comfort, not physics: vertical tilt is what makes people queasy, so the camera is
+            // allowed to follow roll fully while taking only a share of pitch. Applied to the
+            // ERROR rather than to the result, so the spring stays critically damped - scaling the
+            // output would leave a permanent offset that the spring would keep pulling against.
+            if (pitchAxis != null && pitchGain < 1.0f) {
+                final float along = this.error.dot(pitchAxis);
+
+                this.error.fma(-(1.0f - pitchGain) * along, pitchAxis);
+            }
+
+            // Critically damped second order: a = w^2 * x - 2*z*w * v
+            this.velocity.fma(omega * omega * sub, this.error)
+                    .fma(-2.0f * zeta * omega * sub, this.velocity);
+
+            if (!this.velocity.isFinite()) {
+                this.velocity.zero();
+            }
+
+            CfMath.clampAngle(this.velocity, maxRate);
+
+            this.step.set(this.velocity).mul(sub);
+
+            this.current.premul(CfMath.exp(this.step)).normalize();
+        }
+
+        return this.current;
+    }
+
+    /** True once the camera is level and still, so the frame can be handed back to ACS. */
+    public boolean settled() {
+        return CfMath.log(this.current).length() < RESIDUAL_EPSILON
+                && this.velocity.length() < RESIDUAL_EPSILON;
+    }
+
+    public Quaternionf value() {
+        return this.current;
     }
 }
