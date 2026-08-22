@@ -3,7 +3,8 @@ package dev.gamir.sable_cf.client;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.gamir.sable_cf.CfConfig;
-import dev.gamir.sable_cf.physics.CentrifugalHandler;
+import dev.gamir.sable_cf.physics.BodyFrame;
+import dev.gamir.sable_cf.physics.BodyFrameHolder;
 import dev.gamir.sable_cf.physics.ForceState;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
@@ -105,7 +106,17 @@ public final class DebugArrows {
             return;
         }
 
-        final ForceState state = CentrifugalHandler.STATE;
+        if (!(player instanceof BodyFrameHolder holder)) {
+            return;
+        }
+
+        final BodyFrame frame = holder.sable_cf$bodyFrameOrNull();
+
+        if (frame == null) {
+            return;
+        }
+
+        final ForceState state = frame.state();
 
         // Smoothing runs on wall-clock time, not ticks, so it looks the same at 30 and at 300 fps.
         final long now = System.nanoTime();
