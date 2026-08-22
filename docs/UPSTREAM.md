@@ -1,100 +1,130 @@
 # Upstream requests
 
-This mod would rather call an API than mix in. Two mixins remain, and each maps to one small change
-upstream. Written to be pasteable into an issue.
+Five requests, each with the code path that forced it. Written to be pasted into an issue.
+
+One request from the earlier version of this document has been **withdrawn** - see the end.
 
 ---
 
-## Sable
+## 1. Sable: implement `getCustomEntityOrientation`, and fix the predicate that disables it
 
-### 1. `hasCustomEntityOrientation` and `getCustomEntityOrientation` contradict each other
+**Where:** `api/entity/EntitySubLevelUtil` - `getCustomEntityOrientation` returns `null`,
+`hasCustomEntityOrientation` returns `false`.
 
-`EntitySubLevelUtil.getCustomEntityOrientation` is the natural hook for an entity that should be
-oriented by something other than the sub-level's own pose, and `mixin/entity/entities_turn_with_sub_levels/GameRendererMixin`
-reads it. But the guard around that call is:
+The shape of the API is already right; there is simply nothing behind it. Everything an external mod
+needs in order to rotate an entity's collision box is a way to answer "what is this entity's
+orientation" - Sable's own collision code then builds the oriented box and runs SAT, which it already
+does well.
 
-```java
-if (standingSubLevel != null && player.getVehicle() == null && !standingSubLevel.isRemoved()
-        && !EntitySubLevelUtil.hasCustomEntityOrientation(player)) {
-    final Quaterniondc customOrientation = EntitySubLevelUtil.getCustomEntityOrientation(player, 1.0f);
-    ...
-}
-```
+**Ask:** a small provider registry, roughly
+`registerOrientationProvider(Predicate<Entity>, Function<Entity, Quaterniondc>)`, consulted by both
+methods. Five lines plus a list.
 
-So `hasCustomEntityOrientation` returning `true` disables the entire block, including the call to
-`getCustomEntityOrientation` - the two methods cannot both be answered honestly. Anyone supplying a
-custom orientation has to override the getter while leaving the predicate returning `false`, which
-reads like a bug even though it is the only thing that works.
+**The contradiction, which matters more than the stub:** in `GameRendererMixin` the condition
+includes `!hasCustomEntityOrientation(player)`. A provider that answers `true` there switches off the
+entire block *including the call to the getter*. So the hook, once implemented naively, disables
+itself. Whatever the registry ends up looking like, these two call sites need to agree on the
+polarity.
 
-**Ask:** either let a provider return a non-null orientation with the predicate returning `true`, or
-drop the predicate from the guard. Both currently return constants (`null` / `false`), so this is a
-free change.
-
-**Better ask:** a small registration surface, so no mixin is needed at all:
-
-```java
-EntitySubLevelUtil.registerOrientationProvider((entity, partialTicks) -> quaternionOrNull);
-```
-
-### 2. The contact manifold is `@ApiStatus.Internal`
-
-`EntityMovementExtension#sable$getCollisionInfo()` is exactly what a mod needs to know *which*
-surface an entity is resting against, and it is marked internal. Without it, the surface normal has
-to be re-derived by testing the six deck axes against felt-down and blending them (`SurfaceEstimator`
-here) - which works, and even has the pleasant side effect of a smooth floor-to-wall transition, but
-it is a reconstruction of information Sable already has exactly.
-
-**Ask:** a read-only accessor for the resting surface normal, or a supported view of the manifold.
-
-### 3. Eye position is not offset along the body's up axis
-
-With a rotated hitbox, the eye should sit along the body's own up axis rather than at vanilla eye
-height on the world's Y. Vanilla computes eye position in several places, and patching all of them
-from a downstream mod means either a broad mixin or a visible discrepancy. This mod currently accepts
-the discrepancy: lying against a drum wall, the camera is slightly inside the body.
-
-**Ask:** route eye position through one overridable point, or offer
-`EntitySubLevelUtil.getCustomEyeOffset(entity, partialTicks)` alongside the orientation hook.
-
-### 4. Collision testing against an oriented box
-
-The deepest version of the same request. `Entity#makeBoundingBox` is mixed in here to re-fit a
-rotated OBB to an AABB, which necessarily inflates it - at 45 degrees a 0.6 x 1.8 player needs about
-1.7 blocks of width, enough to wedge in a one-block corridor. Sable already does oriented collision
-work against sub-level geometry internally.
-
-**Ask:** let an entity declare a body orientation that Sable's collision path uses directly, instead
-of every downstream mod approximating it with an inflated AABB.
+This mod currently mixes into `getCustomEntityOrientation` at `HEAD` and deliberately leaves
+`hasCustomEntityOrientation` returning `false` for exactly that reason. That is a workaround, and it
+is the only reason a mixin is needed here at all.
 
 ---
 
-## Aeronautics Camera Sync
+## 2. Sable: public read access to the contact manifold
 
-### 5. Release `addTiltSource`
+**Where:** `sable$getCollisionInfo()` is `@ApiStatus.Internal`.
 
-`AcsHandle#addTiltSource(int priority, TiltSource)` exists on `api-beta` but not in `1.3.7`. It is
-the correct extension point and it works well - priority ordering, `appliesTo` gating, `tiltScale()`
-applied for free - so the only problem is that using it means asking people to build a branch.
+**Priority: low - accuracy only.** This was a bigger ask in the previous revision, when the surface
+normal was inferred by choosing whichever of the six sub-level axes was most opposed to felt-down.
+That inference is gone; the mod now probes real block shapes along each local axis, which is correct
+for flat faces and for multi-contact blends.
 
-**Ask:** ship it in a release. Nothing else is needed.
+What is still approximate is **shape detail**: a slab, a stair or a fence gives a probe hit whose
+normal is taken as the axis normal. Sable already computes the true contact normal internally during
+resolution. Exposing a read-only view of it would remove the last approximation, and would let
+consumers stop duplicating shape queries that Sable performs anyway.
 
-Two notes from using it, both worth documenting rather than changing:
-
-- `AcsHandle#state()` must not be called from inside a `TiltSource`, since `state()` polls the
-  sources. It is a straightforward infinite recursion and the fix is to read everything from
-  `TiltContext` - which already carries what is needed. Worth a line in `docs/API.md`.
-- `TiltContext#deltaTicks()` being realtime rather than tick-quantised is what makes a framerate
-  independent spring possible. Please keep it.
+**Ask:** a read-only accessor, or a small immutable record of the last resolved contacts (normal,
+depth, and which sub-level).
 
 ---
 
-## Minecraft / NeoForge
+## 3. Sable: public angular velocity of a sub-level on the client
 
-### 6. `RenderType.create` is `protected static`
+The field exists and is private. External code is left differentiating successive poses, which is
+noisy exactly where it matters most - the moment a ride changes rate - and forces a low-pass filter
+that costs responsiveness to buy stability.
 
-Not a request, a note on why this mod's debug arrows do not draw through terrain. Building a render
-type with `NO_DEPTH_TEST` needs `RenderType.create`, which requires an access transformer, and
-setting `RenderSystem.disableDepthTest()` by hand does not work because a render type re-applies its
-own depth shard in `setupRenderState()` when the batch is flushed. The arrows are biased towards the
-camera instead, which puts them in front of the player model - the actual complaint - and world
-geometry still occludes them. If the overlay ever becomes more than a debug aid, add the AT.
+**Ask:** `Vector3dc angularVelocity()` on `SubLevel`, available client-side. If the value is already
+maintained for the physics step, publishing it costs nothing and is strictly better than every
+consumer's finite difference.
+
+---
+
+## 4. Sable: offset the eye position along the entity's body up-vector
+
+With a rotated collision box, the eye is still placed at `position + eyeHeight * worldUp`. Lying
+against the wall of a spinning drum, that puts the camera slightly inside the body.
+
+**Ask:** when a custom orientation is present, place the eye at
+`position + orientation * (eyeHeight * up)`. Sable already pivots the oriented box about eye height,
+so the quantity is on hand at that point in the code.
+
+This cannot be fixed from outside: `getEyePosition` feeds picking, particles, sounds and the server's
+view of where the player is looking, and overriding it from another mod would fight ACS's ray
+correction rather than cooperate with it.
+
+---
+
+## 5. Sure Footing: a release hook
+
+Sure Footing keeps a player in the sub-level frame across a jump arc, which is the correct behaviour
+and the reason this mod does not touch that part of the problem at all.
+
+What is missing is a way to say "stop carrying this player now": when centrifugal load plus air drag
+exceed friction, the player should leave the frame *at that instant*, with Sable's inherited
+velocity. Today an external mod can only apply forces and hope the carry state resolves in the same
+tick.
+
+**Ask:** either `releaseCarry(Player)`, or a veto hook on `canCarry` so another mod can decline the
+carry for a tick without racing it.
+
+---
+
+## 6. ACS: release `addTiltSource`
+
+`AcsHandle#addTiltSource(int, TiltSource)` exists on the `api-beta` line. Released 1.3.7 exposes only
+`addListener` and `addPolicy`, and neither can set tilt - a listener observes it and a policy affects
+aiming. So any mod that wants to *contribute* a camera orientation currently cannot compile against a
+published artifact, which is a hard blocker rather than an inconvenience.
+
+**Ask:** ship `addTiltSource` in a release.
+
+Two notes from building on it, offered as documentation material:
+
+- **`AcsHandle#state()` must not be called from inside a `TiltSource`.** It re-enters the source and
+  produces a `StackOverflowError`. Worth a line in the javadoc, or an explicit guard.
+- The priority contract ("highest wins", not "blend") is the right choice and worth stating
+  explicitly, because the natural assumption from the name is that sources compose.
+
+---
+
+## Withdrawn: "collision testing against an oriented box"
+
+The previous revision of this document asked Sable to test collision against an oriented box instead
+of an axis-aligned one. **Sable already does this**, and the ask was based on a misreading.
+
+`SubLevelEntityCollision` builds an `OrientedBoundingBox3d` from the entity's unrotated
+`getXsize/getYsize/getZsize` together with the supplied quaternion and runs SAT against sub-level
+blocks. It also expands its consideration bounds by `getEyeHeight()` and pivots about eye height
+rather than the feet.
+
+The practical consequence is worth recording, because it caused a real bug here: **inflating the
+entity's axis-aligned box to enclose the rotated box accomplishes nothing and actively harms.** Sable
+does not consult that box for sub-level collision, while vanilla collision does - so the inflated box
+only ever wedged the player against ordinary main-level blocks in tight spaces. `collide()` also
+early-returns for `ServerPlayer`, so the two sides did not even agree about the inflated shape.
+
+Supplying the orientation and nothing else is the correct integration.
