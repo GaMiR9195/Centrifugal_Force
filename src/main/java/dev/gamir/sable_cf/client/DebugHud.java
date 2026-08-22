@@ -1,14 +1,12 @@
 package dev.gamir.sable_cf.client;
 
 import dev.gamir.sable_cf.CfConfig;
-import dev.gamir.sable_cf.compat.SableAccess;
 import dev.gamir.sable_cf.physics.CentrifugalHandler;
 import dev.gamir.sable_cf.physics.ForceState;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.client.event.RenderGuiEvent;
-import org.joml.Vector3d;
 
 /**
  * The numbers behind the arrows.
@@ -17,6 +15,9 @@ import org.joml.Vector3d;
  * line that matters is press vs hold vs load: friction can hold {@code hold} and something is
  * pushing with {@code load}, so the moment load passes hold you start moving, and you can watch it
  * happen instead of guessing.</p>
+ *
+ * <p>Colours follow the same convention as {@code /sable_cf status}, so the same reading means the
+ * same thing whichever surface you read it from.</p>
  */
 public final class DebugHud {
 
@@ -26,6 +27,7 @@ public final class DebugHud {
     private static final int WHITE = 0xFFFFFFFF;
     private static final int GREEN = 0xFF7CE87C;
     private static final int AMBER = 0xFFFFC050;
+    private static final int RED = 0xFFFF6060;
     private static final int GREY = 0xFFA0A0A0;
 
     @SubscribeEvent
@@ -46,57 +48,66 @@ public final class DebugHud {
         int y = MARGIN;
 
         if (!state.active) {
-            graphics.drawString(minecraft.font, "sable_cf  idle (no rotating sub-level)", MARGIN, y, GREY);
+            graphics.drawString(minecraft.font, "sable_cf idle (no sub-level)", MARGIN, y, GREY);
             return;
         }
 
         final double gravity = CfConfig.GRAVITY;
-        final double omega = state.omega.length();
+        final double spin = state.omega.length();
 
         graphics.drawString(minecraft.font, String.format(
-                "sable_cf  spin %.2f rad/s  (%.1f rpm)", omega, omega * 60.0 / (2.0 * Math.PI)),
+                        "sable_cf spin %.2f rad/s (%.0f rpm) jolt %.1f rad/s2",
+                        spin, spin * 60.0 / (2.0 * Math.PI), state.angularAcceleration.length()),
                 MARGIN, y, WHITE);
         y += LINE_HEIGHT;
 
         graphics.drawString(minecraft.font, String.format(
-                "press %.2f g   hold %.2f g   load %.2f g",
-                state.press / gravity, state.hold / gravity, state.tangentialLoad / gravity),
+                        "press %.2fg hold %.2fg load %.2fg",
+                        state.press / gravity, state.hold / gravity, state.tangentialLoad / gravity),
                 MARGIN, y, state.tangentialLoad > state.hold ? AMBER : GREEN);
         y += LINE_HEIGHT;
 
+        // Deck velocity is the omega x r term. It is on screen because it is the number that
+        // explains being thrown off a spinner: it can be large while your own movement is zero.
         graphics.drawString(minecraft.font, String.format(
-                "air %.1f m/s   drag %.2f g   deck %.1f m/s",
-                state.airVelocity.length(),
-                state.drag.length() / gravity,
-                state.deckVelocity.length()),
+                        "air %.1f m/s deck %.1f m/s own %.1f m/s drag %.2fg",
+                        state.airVelocity.length(),
+                        state.deckVelocity.length(),
+                        state.relativeVelocity.length(),
+                        state.drag.length() / gravity),
                 MARGIN, y, WHITE);
         y += LINE_HEIGHT;
 
         final String footing;
+        final int footingColour;
+
         if (!state.gripped) {
-            footing = "airborne";
+            footing = "no footing";
+            footingColour = RED;
         } else if (state.slipping) {
-            footing = "slipping";
+            footing = "sliding";
+            footingColour = AMBER;
         } else {
-            footing = "planted";
+            footing = "holding";
+            footingColour = GREEN;
         }
 
         graphics.drawString(minecraft.font, String.format(
-                "%s%s   centrifugal %.2f g   applied %.2f g",
-                footing,
-                state.bracing ? " (bracing)" : "",
-                state.centrifugal.length() / gravity,
-                state.applied.length() / gravity),
-                MARGIN, y, state.gripped ? GREEN : AMBER);
+                        "%s%s%s tilt %.2f slip %.1f m/s",
+                        footing,
+                        state.wallRide ? " wall" : "",
+                        state.bracing ? " braced" : "",
+                        state.tilt,
+                        state.slip.length()),
+                MARGIN, y, footingColour);
         y += LINE_HEIGHT;
 
-        // Sable's own handover velocity. Worth showing because it is the reason this mod does NOT
-        // add the deck's momentum by hand when you are flung: Sable already did.
-        final Vector3d inherited = SableAccess.inheritedVelocity(minecraft.player);
-
-        if (inherited != null && inherited.lengthSquared() > 1.0e-6) {
-            graphics.drawString(minecraft.font, String.format(
-                    "sable inherited velocity %.1f m/s", inherited.length()), MARGIN, y, GREY);
-        }
+        graphics.drawString(minecraft.font, String.format(
+                        "centrifugal %.2fg euler+linear %.2fg coriolis %.2fg applied %.2fg",
+                        state.centrifugal.length() / gravity,
+                        state.euler.length() / gravity,
+                        state.coriolis.length() / gravity,
+                        state.applied.length() / gravity),
+                MARGIN, y, GREY);
     }
 }
