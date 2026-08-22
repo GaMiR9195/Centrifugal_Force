@@ -16,7 +16,7 @@ import org.slf4j.LoggerFactory;
 /**
  * Entry point.
  *
- * <p>Three registrations, and the split between them is the whole architecture:</p>
+ * <p>The split between what is registered where is the whole architecture:</p>
  *
  * <ul>
  *   <li>The config is <b>COMMON</b>, not client. It gates the rotated hitbox, and a hitbox only one
@@ -25,8 +25,10 @@ import org.slf4j.LoggerFactory;
  *       code, same answer on both sides.</li>
  *   <li>{@link BodyFrameTicker} runs on <b>both</b> sides. It recomputes body orientation from
  *       Sable's pose, which both sides already have, so the two agree without a single packet.</li>
- *   <li>Only the camera and the debug arrows are client-side, because only they are actually about
- *       what you see.</li>
+ *   <li>Commands are common too, which is what lets them work on a dedicated server rather than
+ *       only in singleplayer.</li>
+ *   <li>Only the camera and the debug arrows are client-side, because only they are about what you
+ *       see rather than about where you are.</li>
  * </ul>
  */
 @Mod(SableCf.MOD_ID)
@@ -43,7 +45,7 @@ public final class SableCf {
         NeoForge.EVENT_BUS.addListener(CfCommands::onRegisterCommands);
 
         if (FMLEnvironment.dist == Dist.CLIENT) {
-            ClientSetup.init(modBus);
+            ClientSetup.init(container);
         }
     }
 }

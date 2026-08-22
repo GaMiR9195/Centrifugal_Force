@@ -5,153 +5,311 @@ import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.builder.LiteralArgumentBuilder;
 import com.mojang.brigadier.context.CommandContext;
 import dev.gamir.sable_cf.CfConfig;
+import dev.gamir.sable_cf.physics.CentrifugalHandler;
+import dev.gamir.sable_cf.physics.ForceState;
+import net.minecraft.ChatFormatting;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
-import net.neoforged.bus.api.SubscribeEvent;
-import net.neoforged.fml.ModList;
-import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
+import net.minecraft.network.chat.MutableComponent;
 import net.neoforged.neoforge.common.ModConfigSpec;
+import net.neoforged.neoforge.event.RegisterCommandsEvent;
+
+import java.util.Locale;
 
 /**
- * {@code /sable_cf}. Client commands, so they need no permission level and work on any server.
+ * {@code /sable_cf}.
  *
- * <p>Every one of them writes into the config and saves, so the value survives a restart and there
- * is no second copy of the defaults anywhere. Tuning this kind of feel is a loop of
- * change-something-while-spinning, and that loop should not include a restart.</p>
+ * <h2>One knob per subsystem</h2>
  *
- * <p>The knobs exposed here are the ones you actually reach for mid-session. The rest - Euler and
- * Coriolis scaling, brace bonus, the safety clamp, arrow scales - live in the config file and the
- * Mods screen, because needing them means you are designing rather than playing.</p>
+ * <p>Every force takes its strength directly - {@code /sable_cf air_resistance 1.4} - with no
+ * sub-parameter to discover and no second number to combine with it mentally. The shaping constants
+ * that used to be exposed as {@code reference_speed} still exist, but they are fixed in
+ * {@link CfConfig} where they can be read once rather than tuned forever. A knob you have to
+ * combine with another knob in your head is not a knob you can tune.</p>
  *
- * <p>(Spelling note, since it comes up: it is <i>centrifugal</i> - from Latin <i>centrum</i> +
- * <i>fugere</i>, "to flee the centre". Its partner is centri<i>petal</i>, "seeking the centre".)</p>
+ * <p>Passing a value also enables the subsystem, because typing a strength and getting no effect is
+ * never what anyone meant by it.</p>
+ *
+ * <h2>Colour convention, applied everywhere</h2>
+ *
+ * <p>Labels are grey and values are coloured, always the same way, so the display can be read at a
+ * glance while you are being flung around rather than parsed:</p>
+ *
+ * <ul>
+ *   <li><b>green</b> on, holding, fine - <b>dark grey</b> off or absent</li>
+ *   <li><b>white</b> a normal reading, <b>yellow</b> getting significant, <b>red</b> at or past the
+ *       point where you lose your footing</li>
+ *   <li><b>aqua</b> a number you set, so a configured value is never confused with a measured one</li>
+ * </ul>
+ *
+ * <p>No column padding. Values sit one space after their label; runs of spaces used as alignment
+ * are what made the old output hard to read in a chat window that is already narrow.</p>
  */
 public final class CfCommands {
 
-    private static final String VALUE = "value";
+    private static final ChatFormatting LABEL = ChatFormatting.GRAY;
+    private static final ChatFormatting SET = ChatFormatting.AQUA;
+    private static final ChatFormatting OFF = ChatFormatting.DARK_GRAY;
+    private static final ChatFormatting OK = ChatFormatting.GREEN;
+    private static final ChatFormatting WARN = ChatFormatting.YELLOW;
+    private static final ChatFormatting DANGER = ChatFormatting.RED;
+    private static final ChatFormatting UNIT = ChatFormatting.DARK_GRAY;
 
-    @SubscribeEvent
-    public void onRegisterClientCommands(final RegisterClientCommandsEvent event) {
+    public static void onRegisterCommands(final RegisterCommandsEvent event) {
         event.getDispatcher().register(build());
     }
 
     private static LiteralArgumentBuilder<CommandSourceStack> build() {
         return Commands.literal("sable_cf")
+                // Bare /sable_cf prints the status: the thing you want most often should be the
+                // least to type.
                 .executes(CfCommands::status)
-
-                .then(Commands.literal("status")
-                        .executes(CfCommands::status))
-
+                .then(Commands.literal("status").executes(CfCommands::status))
                 .then(Commands.literal("debug_overlay")
-                        .executes(context -> setFlag(context, CfConfig.DEBUG_OVERLAY,
-                                !CfConfig.DEBUG_OVERLAY.get(), "debug overlay"))
-                        .then(Commands.argument(VALUE, BoolArgumentType.bool())
-                                .executes(context -> setFlag(context, CfConfig.DEBUG_OVERLAY,
-                                        BoolArgumentType.getBool(context, VALUE), "debug overlay"))))
-
-                .then(Commands.literal("centrifugal_force")
-                        .then(Commands.literal("enable")
-                                .executes(context -> setFlag(context, CfConfig.CENTRIFUGAL_ENABLED,
-                                        true, "centrifugal force")))
-                        .then(Commands.literal("disable")
-                                .executes(context -> setFlag(context, CfConfig.CENTRIFUGAL_ENABLED,
-                                        false, "centrifugal force")))
-                        .then(Commands.literal("strength")
-                                .then(Commands.argument(VALUE, DoubleArgumentType.doubleArg(0.0, 4.0))
-                                        .executes(context -> setValue(context, CfConfig.CENTRIFUGAL_STRENGTH,
-                                                "centrifugal strength", "x physical")))))
-
-                .then(Commands.literal("air_resistance")
-                        .then(Commands.literal("enable")
-                                .executes(context -> setFlag(context, CfConfig.AIR_ENABLED,
-                                        true, "air resistance")))
-                        .then(Commands.literal("disable")
-                                .executes(context -> setFlag(context, CfConfig.AIR_ENABLED,
-                                        false, "air resistance")))
-                        .then(Commands.literal("reference_speed")
-                                .then(Commands.argument(VALUE, DoubleArgumentType.doubleArg(2.0, 200.0))
-                                        .executes(context -> setValue(context, CfConfig.AIR_REFERENCE_SPEED,
-                                                "air reference speed", "m/s = 1 g of drag")))))
-
-                .then(Commands.literal("grip")
-                        .then(Commands.literal("friction")
-                                .then(Commands.argument(VALUE, DoubleArgumentType.doubleArg(0.0, 4.0))
-                                        .executes(context -> setValue(context, CfConfig.GRIP_FRICTION,
-                                                "grip friction", "mu")))))
-
-                .then(Commands.literal("camera")
-                        .then(Commands.literal("enable")
-                                .executes(context -> setFlag(context, CfConfig.CAMERA_ENABLED,
-                                        true, "camera tilt")))
-                        .then(Commands.literal("disable")
-                                .executes(context -> setFlag(context, CfConfig.CAMERA_ENABLED,
-                                        false, "camera tilt")))
-                        .then(Commands.literal("response")
-                                .then(Commands.argument(VALUE, DoubleArgumentType.doubleArg(1.0, 40.0))
-                                        .executes(context -> setValue(context, CfConfig.CAMERA_RESPONSE,
-                                                "camera response", "rad/s"))))
-                        .then(Commands.literal("pitch_response")
-                                .then(Commands.argument(VALUE, DoubleArgumentType.doubleArg(0.0, 1.0))
-                                        .executes(context -> setValue(context, CfConfig.CAMERA_PITCH_RESPONSE,
-                                                "camera pitch response", "of full"))))
-                        .then(Commands.literal("deck_lean")
-                                .then(Commands.argument(VALUE, DoubleArgumentType.doubleArg(0.0, 1.0))
-                                        .executes(context -> setValue(context, CfConfig.CAMERA_DECK_LEAN,
-                                                "camera deck lean", "of full"))))
-                        .then(Commands.literal("max_tilt")
-                                .then(Commands.argument(VALUE, DoubleArgumentType.doubleArg(0.0, 90.0))
-                                        .executes(context -> setValue(context, CfConfig.CAMERA_MAX_TILT_DEG,
-                                                "camera max tilt", "deg")))));
+                        .executes(context -> toggleOverlay(context, null))
+                        .then(Commands.argument("value", BoolArgumentType.bool())
+                                .executes(context -> toggleOverlay(
+                                        context, BoolArgumentType.getBool(context, "value")))))
+                .then(knob("centrifugal_force", CfConfig.CENTRIFUGAL_ENABLED,
+                        CfConfig.CENTRIFUGAL_STRENGTH, 0.0, 4.0))
+                .then(knob("air_resistance", CfConfig.AIR_ENABLED,
+                        CfConfig.AIR_STRENGTH, 0.0, 4.0))
+                .then(knob("grip", CfConfig.GRIP_ENABLED,
+                        CfConfig.GRIP_STRENGTH, 0.0, 4.0))
+                .then(knob("camera", CfConfig.CAMERA_ENABLED,
+                        CfConfig.CAMERA_AMOUNT, 0.0, 2.0))
+                .then(knob("hitbox", CfConfig.HITBOX_ENABLED,
+                        CfConfig.HITBOX_AMOUNT, 0.0, 1.0))
+                .then(Commands.literal("reset")
+                        .requires(source -> source.hasPermission(2))
+                        .executes(CfCommands::reset));
     }
 
-    private static int setFlag(final CommandContext<CommandSourceStack> context,
-                               final ModConfigSpec.BooleanValue config,
-                               final boolean value,
-                               final String label) {
-        config.set(value);
-        config.save();
-        feedback(context, label + ": " + (value ? "on" : "off"));
+    /** {@code <name> enable|disable|<value>}, plus bare {@code <name>} to read it back. */
+    private static LiteralArgumentBuilder<CommandSourceStack> knob(
+            final String name,
+            final ModConfigSpec.BooleanValue enabled,
+            final ModConfigSpec.DoubleValue strength,
+            final double min,
+            final double max) {
+
+        return Commands.literal(name)
+                .requires(source -> source.hasPermission(2))
+                .executes(context -> {
+                    reply(context, describe(name, enabled, strength));
+                    return 1;
+                })
+                .then(Commands.literal("enable").executes(context -> {
+                    enabled.set(true);
+                    enabled.save();
+                    reply(context, describe(name, enabled, strength));
+                    return 1;
+                }))
+                .then(Commands.literal("disable").executes(context -> {
+                    enabled.set(false);
+                    enabled.save();
+                    reply(context, describe(name, enabled, strength));
+                    return 1;
+                }))
+                .then(Commands.argument("strength", DoubleArgumentType.doubleArg(min, max))
+                        .executes(context -> {
+                            strength.set(DoubleArgumentType.getDouble(context, "strength"));
+                            strength.save();
+
+                            // Setting a strength implies wanting it on.
+                            if (!enabled.get()) {
+                                enabled.set(true);
+                                enabled.save();
+                            }
+
+                            reply(context, describe(name, enabled, strength));
+                            return 1;
+                        }));
+    }
+
+    private static int toggleOverlay(
+            final CommandContext<CommandSourceStack> context, final Boolean explicit) {
+
+        final boolean value = explicit != null ? explicit : !CfConfig.DEBUG_OVERLAY.get();
+
+        CfConfig.DEBUG_OVERLAY.set(value);
+        CfConfig.DEBUG_OVERLAY.save();
+
+        reply(context, label("debug overlay").append(onOff(value)));
+
         return 1;
     }
 
-    private static int setValue(final CommandContext<CommandSourceStack> context,
-                                final ModConfigSpec.DoubleValue config,
-                                final String label,
-                                final String unit) {
-        final double value = DoubleArgumentType.getDouble(context, VALUE);
-        config.set(value);
-        config.save();
-        feedback(context, String.format("%s = %.3f %s", label, value, unit));
+    private static int reset(final CommandContext<CommandSourceStack> context) {
+        set(CfConfig.CENTRIFUGAL_ENABLED, true);
+        set(CfConfig.CENTRIFUGAL_STRENGTH, 1.0);
+        set(CfConfig.CORIOLIS_STRENGTH, 0.35);
+        set(CfConfig.AIR_ENABLED, true);
+        set(CfConfig.AIR_STRENGTH, 1.0);
+        set(CfConfig.GRIP_ENABLED, true);
+        set(CfConfig.GRIP_STRENGTH, 0.85);
+        set(CfConfig.HITBOX_ENABLED, true);
+        set(CfConfig.HITBOX_AMOUNT, 1.0);
+        set(CfConfig.CAMERA_ENABLED, true);
+        set(CfConfig.CAMERA_AMOUNT, 1.0);
+        set(CfConfig.CAMERA_RESPONSE, 9.0);
+        set(CfConfig.CAMERA_DAMPING, 1.0);
+        set(CfConfig.CAMERA_JOLT_GAIN, 1.6);
+        set(CfConfig.CAMERA_LOOP_SUPPRESSION, 0.85);
+        set(CfConfig.CAMERA_WALK_DAMPING, 0.65);
+
+        reply(context, Component.literal("Reset to defaults.").withStyle(OK));
+
         return 1;
     }
+
+    private static <T> void set(final ModConfigSpec.ConfigValue<T> value, final T fresh) {
+        value.set(fresh);
+        value.save();
+    }
+
+    // ---------------------------------------------------------------- status
 
     private static int status(final CommandContext<CommandSourceStack> context) {
-        feedback(context, "--- sable_cf ---");
-        feedback(context, String.format("centrifugal_force  %s   strength %.2f",
-                onOff(CfConfig.CENTRIFUGAL_ENABLED.get()), CfConfig.CENTRIFUGAL_STRENGTH.get()));
-        feedback(context, String.format("air_resistance     %s   reference_speed %.1f m/s",
-                onOff(CfConfig.AIR_ENABLED.get()), CfConfig.AIR_REFERENCE_SPEED.get()));
-        feedback(context, String.format("grip               friction %.2f   brace x%.2f",
-                CfConfig.GRIP_FRICTION.get(), CfConfig.GRIP_BRACE_BONUS.get()));
-        feedback(context, String.format("camera             %s   response %.1f   pitch %.2f   lean %.2f   max %.0f deg",
-                onOff(CfConfig.CAMERA_ENABLED.get()), CfConfig.CAMERA_RESPONSE.get(),
-                CfConfig.CAMERA_PITCH_RESPONSE.get(), CfConfig.CAMERA_DECK_LEAN.get(),
-                CfConfig.CAMERA_MAX_TILT_DEG.get()));
-        feedback(context, "debug_overlay      " + onOff(CfConfig.DEBUG_OVERLAY.get()));
+        final ForceState state = CentrifugalHandler.STATE;
 
-        if (!ModList.get().isLoaded("aero_cam_sync")) {
-            feedback(context, "note: Aeronautics Camera Sync is not installed, so camera tilt cannot run.");
+        final MutableComponent header = Component.literal("Sable CF ")
+                .withStyle(ChatFormatting.GOLD, ChatFormatting.BOLD)
+                .append(state.active
+                        ? Component.literal("on a sub-level").withStyle(OK)
+                        : Component.literal("not on a sub-level").withStyle(OFF));
+
+        reply(context, header);
+
+        reply(context, join(
+                describe("centrifugal", CfConfig.CENTRIFUGAL_ENABLED, CfConfig.CENTRIFUGAL_STRENGTH),
+                describe("air", CfConfig.AIR_ENABLED, CfConfig.AIR_STRENGTH),
+                describe("grip", CfConfig.GRIP_ENABLED, CfConfig.GRIP_STRENGTH)));
+
+        reply(context, join(
+                describe("camera", CfConfig.CAMERA_ENABLED, CfConfig.CAMERA_AMOUNT),
+                describe("hitbox", CfConfig.HITBOX_ENABLED, CfConfig.HITBOX_AMOUNT),
+                label("overlay").append(onOff(CfConfig.DEBUG_OVERLAY.get()))));
+
+        if (!state.active) {
+            reply(context, Component.literal("Stand on a Sable contraption for live readings.")
+                    .withStyle(OFF));
+            return 1;
         }
+
+        // Press in g, because "1.4 g" is a quantity people have intuition about and "44.8 m/s^2"
+        // is not.
+        final double pressG = state.press / CfConfig.GRAVITY;
+
+        reply(context, join(
+                label("press").append(number(pressG, pressColour(pressG))).append(unit(" g")),
+                label("load").append(number(state.tangentialLoad,
+                        state.tangentialLoad <= state.hold ? OK : DANGER)),
+                label("hold").append(number(state.hold, ChatFormatting.WHITE))));
+
+        final MutableComponent footing = state.gripped
+                ? (state.slipping
+                        ? Component.literal("sliding").withStyle(WARN)
+                        : Component.literal("holding").withStyle(OK))
+                : Component.literal("no footing").withStyle(DANGER);
+
+        final MutableComponent third = state.wallRide
+                ? Component.literal(" wall ride").withStyle(ChatFormatting.LIGHT_PURPLE)
+                : Component.empty();
+
+        reply(context, join(
+                label("footing").append(footing).append(third),
+                label("brace").append(onOff(state.bracing)),
+                label("tilt").append(number(state.tilt, state.tilt > 0.5 ? WARN : ChatFormatting.WHITE))));
+
+        final double spin = state.omega.length();
+        final double jolt = state.angularAcceleration.length();
+
+        reply(context, join(
+                label("spin").append(number(spin, spin > 2.5 ? WARN : ChatFormatting.WHITE))
+                        .append(unit(" rad/s")),
+                label("jolt").append(number(jolt, jolt > 6.0 ? WARN : ChatFormatting.WHITE))
+                        .append(unit(" rad/s2")),
+                label("air").append(number(state.airVelocity.length(), ChatFormatting.WHITE))
+                        .append(unit(" m/s"))));
 
         return 1;
     }
 
-    private static String onOff(final boolean value) {
-        return value ? "on " : "off";
+    private static ChatFormatting pressColour(final double pressG) {
+        if (pressG < CfConfig.GRIP_MIN_PRESS_G.get()) {
+            return DANGER;
+        }
+
+        if (pressG < 0.75) {
+            return WARN;
+        }
+
+        if (pressG > 3.0) {
+            return DANGER;
+        }
+
+        if (pressG > 1.5) {
+            return WARN;
+        }
+
+        return ChatFormatting.WHITE;
     }
 
-    private static void feedback(final CommandContext<CommandSourceStack> context, final String message) {
-        context.getSource().sendSuccess(() -> Component.literal(message), false);
+    // ---------------------------------------------------------------- component helpers
+
+    private static MutableComponent describe(
+            final String name,
+            final ModConfigSpec.BooleanValue enabled,
+            final ModConfigSpec.DoubleValue strength) {
+
+        final MutableComponent value = enabled.get()
+                ? number(strength.get(), SET)
+                : Component.literal("off").withStyle(OFF);
+
+        return label(name).append(value);
+    }
+
+    /** Grey label plus exactly one space. No padding, ever. */
+    private static MutableComponent label(final String text) {
+        return Component.literal(text + " ").withStyle(LABEL);
+    }
+
+    private static MutableComponent number(final double value, final ChatFormatting colour) {
+        return Component.literal(String.format(Locale.ROOT, "%.2f", value)).withStyle(colour);
+    }
+
+    private static MutableComponent unit(final String text) {
+        return Component.literal(text).withStyle(UNIT);
+    }
+
+    private static MutableComponent onOff(final boolean value) {
+        return value
+                ? Component.literal("on").withStyle(OK)
+                : Component.literal("off").withStyle(OFF);
+    }
+
+    /** Joins fields with a single separator, so nothing is aligned by padding. */
+    private static MutableComponent join(final MutableComponent... parts) {
+        final MutableComponent out = Component.empty();
+
+        for (int i = 0; i < parts.length; i++) {
+            if (i > 0) {
+                out.append(Component.literal(" \u00b7 ").withStyle(OFF));
+            }
+
+            out.append(parts[i]);
+        }
+
+        return out;
+    }
+
+    private static void reply(
+            final CommandContext<CommandSourceStack> context, final Component message) {
+        context.getSource().sendSuccess(() -> message, false);
+    }
+
+    private CfCommands() {
     }
 }

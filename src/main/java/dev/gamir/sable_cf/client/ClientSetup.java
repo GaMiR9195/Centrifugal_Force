@@ -1,7 +1,6 @@
 package dev.gamir.sable_cf.client;
 
 import dev.gamir.sable_cf.SableCf;
-import dev.gamir.sable_cf.command.CfCommands;
 import dev.gamir.sable_cf.physics.CentrifugalHandler;
 import net.neoforged.fml.ModContainer;
 import net.neoforged.fml.ModList;
@@ -9,14 +8,19 @@ import net.neoforged.neoforge.client.gui.ConfigurationScreen;
 import net.neoforged.neoforge.client.gui.IConfigScreenFactory;
 import net.neoforged.neoforge.common.NeoForge;
 
-/** Client wiring. Called from the mod constructor, and only on a client dist. */
+/**
+ * Client wiring. Called from the mod constructor, and only on a client dist.
+ *
+ * <p>Commands are deliberately not registered here. They mutate a common config that the server
+ * also reads, so they belong on the common bus - registering them from client setup would have
+ * meant they silently did nothing on a dedicated server.</p>
+ */
 public final class ClientSetup {
 
     public static void init(final ModContainer container) {
         NeoForge.EVENT_BUS.register(new CentrifugalHandler());
         NeoForge.EVENT_BUS.register(new DebugArrows());
         NeoForge.EVENT_BUS.register(new DebugHud());
-        NeoForge.EVENT_BUS.register(new CfCommands());
 
         // Gives the Mods screen a working Config button for free - the commands are for tuning
         // while you are actually spinning, the screen is for reading the descriptions.
@@ -30,7 +34,7 @@ public final class ClientSetup {
         } else {
             SableCf.LOGGER.info(
                     "Aeronautics Camera Sync is not installed - camera tilt is off. "
-                            + "The physics and the debug overlay do not need it.");
+                            + "The physics, the rotated hitbox and the debug overlay do not need it.");
         }
     }
 
