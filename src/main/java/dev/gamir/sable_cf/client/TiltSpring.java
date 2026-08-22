@@ -17,6 +17,14 @@ import org.joml.Vector3f;
  * <p>Integrated in sub-steps of at most 1/60 s so that a frame spike cannot make the explicit
  * integrator ring, and the angular velocity is clamped so a contraption that snaps 180 degrees in
  * one tick makes the camera lean over rather than whip.</p>
+ *
+ * <h2>Why the parameters are arguments now</h2>
+ *
+ * <p>Stiffness and damping used to be read from the config in here, which meant every situation got
+ * the same spring. That is what made sharp manoeuvres unpredictable: a spring tuned to be calm
+ * enough for walking is too slow for a flick, and one tuned for a flick jitters when you walk.
+ * {@link CfTiltSource} now decides both per frame - stiffer for a sharp manoeuvre, better damped
+ * while walking - and this class just integrates honestly.</p>
  */
 public final class TiltSpring {
 
@@ -27,7 +35,16 @@ public final class TiltSpring {
     private final Quaternionf current = new Quaternionf();
     private final Vector3f angularVelocity = new Vector3f();
 
-    public Quaternionf step(final Quaternionf target, final float deltaTicks) {
+    /**
+     * @param naturalFrequency stiffness, rad/s
+     * @param dampingRatio     1 is critical: fastest approach with no overshoot
+     */
+    public Quaternionf step(
+            final Quaternionf target,
+            final float deltaTicks,
+            final float naturalFrequency,
+            final float dampingRatio) {
+
         // Clamped: a loading hitch must not be integrated as a real second of motion.
         float remaining = Math.min(Math.max(deltaTicks, 0.0f), 4.0f) / 20.0f;
 
@@ -35,8 +52,8 @@ public final class TiltSpring {
             return new Quaternionf(this.current);
         }
 
-        final float naturalFrequency = CfConfig.CAMERA_RESPONSE.get().floatValue();
-        final float damping = CfConfig.CAMERA_DAMPING.get().floatValue();
+        final float frequency = Math.min(Math.max(naturalFrequency, 0.5f), 60.0f);
+        final float damping = Math.min(Math.max(dampingRatio, 0.2f), 4.0f);
         final float slew = (float) Math.toRadians(CfConfig.CAMERA_SLEW_DEG_PER_S.get());
 
         while (remaining > 0.0f) {
@@ -47,8 +64,8 @@ public final class TiltSpring {
             final Vector3f error = CfMath.log(
                     new Quaternionf(target).mul(new Quaternionf(this.current).invert()));
 
-            final Vector3f acceleration = new Vector3f(error).mul(naturalFrequency * naturalFrequency)
-                    .sub(new Vector3f(this.angularVelocity).mul(2.0f * damping * naturalFrequency));
+            final Vector3f acceleration = new Vector3f(error).mul(frequency * frequency)
+                    .sub(new Vector3f(this.angularVelocity).mul(2.0f * damping * frequency));
 
             this.angularVelocity.add(acceleration.mul(dt));
             CfMath.clampAngle(this.angularVelocity, slew);
