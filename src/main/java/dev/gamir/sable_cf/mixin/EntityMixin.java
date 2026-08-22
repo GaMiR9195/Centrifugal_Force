@@ -3,30 +3,40 @@ package dev.gamir.sable_cf.mixin;
 import dev.gamir.sable_cf.physics.BodyFrame;
 import dev.gamir.sable_cf.physics.BodyFrameHolder;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.phys.AABB;
 import org.jetbrains.annotations.Nullable;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
-import org.spongepowered.asm.mixin.injection.At;
-import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /**
- * The one mixin into vanilla, and the only reason this mod needs a mixin config at all.
+ * Adds a {@link BodyFrame} field to every entity. That is all it does.
  *
- * <p>It does exactly two things: it gives every entity somewhere to keep a {@link BodyFrame}, and
- * it lets that body frame refit the collision box. Both are things no API can provide from outside,
- * because Minecraft has no hook for "what shape am I" and no way to attach a field to an entity.</p>
+ * <h2>Why there is no longer a {@code makeBoundingBox} injection</h2>
  *
- * <p>{@code makeBoundingBox} is the right target rather than {@code setBoundingBox} or
- * {@code getBoundingBox}: it is the single place vanilla derives the box from the position and the
- * dimensions, it is called on both sides, and returning a different box from it leaves every
- * downstream consumer - collision, suffocation, entity lookups, rendering the hitbox - reading the
- * same answer. Injecting at RETURN rather than overwriting keeps other mods' injectors working.</p>
+ * <p>There used to be one, re-fitting the rotated body into an axis-aligned box. It has been
+ * removed, and reading Sable's collision code is what settled it:</p>
  *
- * <p>Players only. Rotating mobs would need their AI and pathfinding to understand a rotated body,
- * which they emphatically do not, and rotating item entities would be pure cost.</p>
+ * <ul>
+ *   <li>{@code SubLevelEntityCollision} builds its oriented box from the entity's <i>unrotated</i>
+ *       {@code getXsize/getYsize/getZsize} plus the quaternion from
+ *       {@code EntitySubLevelUtil.getCustomEntityOrientation}, and runs SAT against sub-level
+ *       blocks. Supplying the orientation is therefore the entire job; the box is genuinely
+ *       rotated, not approximated.</li>
+ *   <li>It expands its own broadphase by the eye height, so nothing downstream needs to widen
+ *       anything to be seen.</li>
+ *   <li>It pivots the body about eye height ({@code eyeHeight - bbHeight/2}), not the feet, so a
+ *       feet-pivoted enclosing box positively disagreed with Sable's own.</li>
+ *   <li>{@code collide()} returns early for {@code ServerPlayer}. The server does no sub-level
+ *       collision for players at all, so a widened vanilla box could only ever act against
+ *       <i>main-level</i> geometry - which is precisely how it wedged players in corridors and had
+ *       the server shove them out.</li>
+ * </ul>
+ *
+ * <p>So the widening was not a trade-off that came with rotation; it was a fourth thing that was
+ * never needed. Nothing is inflated anywhere now, and the wedging caveat is gone with it.</p>
+ *
+ * <p>The field lives on the entity rather than in a map keyed by entity because it is read from
+ * both threads on a hot path; a field on the object it describes cannot be contended and cannot
+ * leak when the entity unloads.</p>
  */
 @Mixin(Entity.class)
 public abstract class EntityMixin implements BodyFrameHolder {
@@ -48,29 +58,5 @@ public abstract class EntityMixin implements BodyFrameHolder {
     @Nullable
     public BodyFrame sable_cf$bodyFrameOrNull() {
         return this.sable_cf$frame;
-    }
-
-    @Inject(method = "makeBoundingBox", at = @At("RETURN"), cancellable = true)
-    private void sable_cf$refitBoundingBox(final CallbackInfoReturnable<AABB> callback) {
-        final BodyFrame frame = this.sable_cf$frame;
-
-        // Null on every entity that has never been on a sub-level, and untilted on every player
-        // standing on a normal floor. This path runs several times per entity per tick, so the
-        // common case has to cost one field read and one boolean.
-        if (frame == null || !frame.isTilted()) {
-            return;
-        }
-
-        final Entity self = (Entity) (Object) this;
-
-        if (!(self instanceof Player)) {
-            return;
-        }
-
-        final AABB refitted = frame.fitBoundingBox(self, callback.getReturnValue());
-
-        if (refitted != null) {
-            callback.setReturnValue(refitted);
-        }
     }
 }

@@ -1,6 +1,5 @@
 package dev.gamir.sable_cf.physics;
 
-import dev.gamir.sable_cf.physics.BodyFrameHolder;
 import net.minecraft.world.entity.player.Player;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.tick.PlayerTickEvent;
@@ -8,10 +7,15 @@ import net.neoforged.neoforge.event.tick.PlayerTickEvent;
 /**
  * Drives {@link BodyFrame} for every player, on both sides.
  *
- * <p>{@code Pre} rather than {@code Post} on purpose. The body frame decides the shape of the
- * collision box, so it has to be up to date <i>before</i> the movement that will be tested against
- * that box. On {@code Post} the box would always be one tick behind the pose, which shows up as
- * catching on doorframes when a contraption is turning.</p>
+ * <p>{@code Pre} rather than {@code Post} on purpose. The body frame decides the orientation the
+ * collision path will use, so it has to be up to date <i>before</i> the movement that will be
+ * tested with it. On {@code Post} the orientation would always be one tick behind the pose, which
+ * shows up as catching on doorframes when a contraption is turning.</p>
+ *
+ * <p>There is deliberately no {@code refreshDimensions()} call here. It existed to force vanilla to
+ * rebuild the bounding box for the old AABB refit; with the refit gone there is no box to rebuild,
+ * and calling it every tick for every player was pure cost - it also re-entered the size
+ * calculation, which is not somewhere to be while deriving a body orientation.</p>
  */
 public final class BodyFrameTicker {
 
@@ -24,12 +28,6 @@ public final class BodyFrameTicker {
             return;
         }
 
-        final BodyFrame frame = holder.sable_cf$bodyFrame();
-
-        frame.tick(player);
-
-        // The refit is driven off the box being rebuilt, and that only happens when the entity
-        // moves. A body that tilts while standing still would otherwise keep an upright box.
-        player.refreshDimensions();
+        holder.sable_cf$bodyFrame().tick(player);
     }
 }
