@@ -5,14 +5,14 @@ import net.neoforged.neoforge.common.ModConfigSpec;
 /**
  * Config, and the only place a number lives. Commands write straight into these and save.
  *
- * <h2>Why there is no longer a 'slip'</h2>
+ * <h2>The model, in one paragraph</h2>
  *
- * <p>There were two knobs for one idea, and the overlap was not cosmetic: switching air resistance
- * off did not stop you sliding off, because the other one was still pushing. Peeling a player off a
- * contraption is ONE mechanism and it belongs to {@code air_resistance} - the headwind that drags
- * you and the outward creep that walks you to the rim are the same statement about the same ride.
- * The wall CLIMB was never part of that idea and has its own {@code wall} section now, because it
- * is the opposite force: the one that keeps you on.</p>
+ * <p>This mod is wall walking with a physical trigger. A sub-level that <b>rotates</b> defines a
+ * gravity plane - one of its six local faces - and while the ride holds you against that face you
+ * stand on it: body, collision box and camera. How firmly it holds you is one number, {@code stick}.
+ * The only thing that stops you being glued on for free is {@code air_resistance}, which adds a load
+ * friction has to fight. Everything else in this file is either the shape of {@code stick} or the
+ * shape of the friction solve.</p>
  *
  * <h2>Units</h2>
  *
@@ -24,6 +24,9 @@ public final class CfConfig {
     /** Minecraft gravity in Sable's units. Not 9.81. */
     public static final double GRAVITY = 32.0;
 
+    /** One tick, in seconds. Every half-life in this file is converted against it. */
+    public static final double TICK = 1.0 / 20.0;
+
     // ---------------------------------------------------------------- drag shaping
 
     private static final double AIR_REFERENCE_SPEED = 40.0;
@@ -33,111 +36,93 @@ public final class CfConfig {
 
     private static final double AIR_SOFT_CAP_G = 2.2;
 
-    // ---------------------------------------------------------------- body orientation
-
-    /** Blend sharpness between contacting faces for the PHYSICS normal. Low = rounder ramp. */
-    public static final double SURFACE_BLEND_SHARPNESS = 6.0;
-
-    /** Half-life, s, of the body orientation chasing its target. Drives the camera only. */
-    public static final double BODY_HALF_LIFE = 0.16;
-
-    /** Cap on how fast the body may turn, deg/s. */
-    public static final double BODY_SLEW_DEG_PER_S = 240.0;
+    // ---------------------------------------------------------------- frame kinematics
 
     /**
-     * Half-life, s, of the COLLISION orientation chasing the body. Slower than the body on purpose.
+     * Half-life, s, of the low-pass on the sub-level's ANGULAR velocity.
      *
-     * <p>Sable turns the collision box about the player's EYE, not their feet, so a lean of A
-     * degrees sweeps the feet sideways by {@code 2 * 1.62 * sin(A/2)} blocks. Move that fast beside
-     * a wall and SAT reports a metre-deep penetration, which comes straight back as a metre-long
-     * shove. Slow is not politeness, it is the difference between leaning and being fired through
-     * the wall.</p>
+     * <p>Angular velocity is what gets filtered now, and that is the whole reason the force stopped
+     * lagging. The old code filtered the acceleration itself, which on a steady spin is a vector
+     * rotating at omega - and a first-order lag on a rotating vector turns it sideways. Omega is
+     * <i>constant</i> on a steady spin, in world space as well as in the deck's, so filtering it
+     * costs no direction error at all. The centripetal term is then rebuilt from the CURRENT
+     * position: {@code omega x (omega x r)} points exactly at the axis, by construction.</p>
      */
-    public static final double HITBOX_HALF_LIFE = 0.30;
+    public static final double OMEGA_HALF_LIFE = 0.09;
 
-    /** Cap on how fast the collision box may turn, deg/s. */
-    public static final double HITBOX_SLEW_DEG_PER_S = 70.0;
+    /** Half-life, s, of the low-pass on angular acceleration. Longer: it is a second difference. */
+    public static final double ALPHA_HALF_LIFE = 0.16;
+
+    /** Half-life, s, of the low-pass on the pivot's linear acceleration. */
+    public static final double PIVOT_ACCEL_HALF_LIFE = 0.14;
+
+    /**
+     * Linear acceleration of the whole contraption below this, in g, is exactly zero.
+     *
+     * <p>Deliberately much harsher than the old global dead-zone, and it can afford to be: a lift
+     * or a ship produces ONLY this term, so throwing it away entirely is the structural guarantee
+     * that a non-rotating sub-level does nothing. The rotational terms are not dead-zoned at all -
+     * they are gated on {@link #SPIN_DEADZONE} instead, which is a property of the ride rather than
+     * a magnitude that noise can reach.</p>
+     */
+    public static final double LINEAR_ACCEL_DEADZONE_G = 0.35;
+
+    public static final double LINEAR_ACCEL_FULL_G = 0.75;
+
+    /**
+     * Spin rate, rad/s, below which the sub-level is not "a ride": no plane, no stick, no climb.
+     * A gate on angular velocity itself, not on a force a translation could also produce.
+     */
+    public static final double SPIN_DEADZONE = 0.12;
+
+    public static final double SPIN_FULL = 0.35;
+
+    /** Faster than this across the deck is a teleport or a re-anchor, not a slide. */
+    public static final double MAX_DECK_RELATIVE = 100.0;
+
+    public static final double DECK_RELATIVE_HALF_LIFE = 0.07;
+
+    // ---------------------------------------------------------------- plane switching
+
+    /** Contacts are re-probed this far outside the body, in local blocks. */
+    public static final double PROBE_DEPTH = 0.14;
+
+    /** How much to pull a probe slab in on its other two axes, so corners do not read as faces. */
+    public static final double PROBE_SIDE_SHRINK = 0.08;
 
     /** How far to shrink the body box before testing whether a lean fits, blocks. */
-    public static final double CLEARANCE_SHRINK = 0.06;
+    public static final double CLEARANCE_SHRINK = 0.05;
 
-    /**
-     * Half-life, s, of the low-pass on the frame acceleration. Applied in the SUB-LEVEL's frame.
-     *
-     * <p>A steady spin is constant in the deck's frame but rotating in the world, and a first-order
-     * lag on a rotating vector rotates it backwards - about 16 degrees at 2.5 rad/s - which is a
-     * permanent sideways shove out of nothing.</p>
-     */
-    public static final double FRAME_ACCEL_HALF_LIFE = 0.10;
-
-    /** Frame acceleration below this, in g, is exactly zero. Anti-noise only. */
-    public static final double FRAME_ACCEL_DEADZONE_G = 0.06;
-
-    public static final double FRAME_ACCEL_FULL_G = 0.14;
-
-    /**
-     * Spin rate, rad/s, below which nothing rotation-specific happens: no attach, no creep, no
-     * climb. A gate on angular velocity itself, not on a force a translation could also produce.
-     */
-    public static final double SPIN_DEADZONE = 0.15;
-
-    public static final double SPIN_FULL = 0.45;
+    /** Below this cosine, world up and the target are antiparallel and the axis must be supplied. */
+    public static final double ANTIPARALLEL_COSINE = -0.995;
 
     /** cos of the angle past which a contact is REPORTED as a wall. Display only. */
     public static final double WALL_COSINE = 0.55;
 
-    public static final double DECK_RELATIVE_HALF_LIFE = 0.08;
-
-    /**
-     * How far felt gravity must have left world gravity before the body leans, as {@code 1-feltUp.y}.
-     *
-     * <p>This replaced gating the lean on the ride's SHARE of the press, and the difference is why
-     * wall entry never worked. The share is near zero on the FLOOR of a drum - correctly, a
-     * horizontal centrifugal vector presses you into a floor by nothing - so you walked to the wall
-     * bolt upright right up until the moment you needed not to be. Felt gravity has no blind spot:
-     * it is already leaning outward while you are still on the floor.</p>
-     *
-     * <p>The old guarantee survives. A sub-level that merely travels has felt gravity equal to
-     * world gravity by construction, so this is identically zero for lifts, ships and drawbridges
-     * however hard they accelerate.</p>
-     */
-    public static final double TILT_DEVIATION_LOW = 0.04;
-
-    public static final double TILT_DEVIATION_HIGH = 0.35;
-
-    /** How well the face you touch must oppose felt-down before you stand on it. */
-    public static final double TILT_ALIGN_LOW = 0.15;
-
-    public static final double TILT_ALIGN_HIGH = 0.70;
-
-    public static final double CLIMB_SHARE_LOW = 0.30;
-
-    public static final double CLIMB_SHARE_HIGH = 0.65;
+    // ---------------------------------------------------------------- misc rails
 
     /**
      * How fast the player may already be closing on a surface, m/s, before the mod stops pressing
-     * them into it harder.
-     *
-     * <p>Sable resolves contact positionally and never zeroes {@code deltaMovement} against a
-     * sub-level wall, so an into-surface acceleration applied every tick with nothing watching the
-     * result accumulates into a stored velocity. It stays invisible until one tick resolves the
-     * whole penetration at once and fires you through the wall.</p>
+     * them into it harder. Sable resolves contact positionally and never zeroes deltaMovement
+     * against a sub-level face, so an unwatched into-surface term accumulates and then fires you
+     * through the wall in a single tick.
      */
     public static final double PRESS_MAX_SPEED = 6.0;
 
     /** Acceleration, m/s^2, the walk keys get along a surface you are pinned to. */
-    public static final double WALL_WALK_ACCEL = 26.0;
+    public static final double WALL_WALK_ACCEL = 30.0;
 
     /** Hard ceiling, m/s, on a release velocity. A sanity rail. */
     public static final double RELEASE_MAX_SPEED = 40.0;
 
-    /** Below this cosine, world up and the target are antiparallel and the axis must be supplied. */
-    public static final double ANTIPARALLEL_COSINE = -0.995;
+    /** Above this press, in g, fall damage is suppressed: you are being held, not falling. */
+    public static final double FALL_RESET_G = 1.2;
 
     public static final ModConfigSpec SPEC;
 
     public static final ModConfigSpec.BooleanValue CENTRIFUGAL_ENABLED;
     public static final ModConfigSpec.DoubleValue CENTRIFUGAL_STRENGTH;
+    public static final ModConfigSpec.DoubleValue CENTRIFUGAL_LEAD;
     public static final ModConfigSpec.DoubleValue CORIOLIS_STRENGTH;
     public static final ModConfigSpec.DoubleValue MAX_ACCEL_G;
 
@@ -151,16 +136,21 @@ public final class CfConfig {
     public static final ModConfigSpec.DoubleValue GRIP_BRACE_BONUS;
     public static final ModConfigSpec.DoubleValue GRIP_MIN_PRESS_G;
     public static final ModConfigSpec.DoubleValue GRIP_FULL_PRESS_G;
+    public static final ModConfigSpec.DoubleValue GRIP_SLIDE_DAMPING;
     public static final ModConfigSpec.DoubleValue GRIP_SLIDE_CAP_G;
-    public static final ModConfigSpec.DoubleValue ATTACH_PRESS_G;
-    public static final ModConfigSpec.DoubleValue ATTACH_RELEASE_G;
-    public static final ModConfigSpec.DoubleValue ATTACH_SHARE;
-    public static final ModConfigSpec.DoubleValue ATTACH_ADHESION_G;
 
     public static final ModConfigSpec.BooleanValue WALL_ENABLED;
     public static final ModConfigSpec.DoubleValue WALL_STRENGTH;
-    public static final ModConfigSpec.DoubleValue WALL_PRESS_G;
+    public static final ModConfigSpec.DoubleValue WALL_MIN_PRESS_G;
+    public static final ModConfigSpec.DoubleValue WALL_FULL_PRESS_G;
+    public static final ModConfigSpec.DoubleValue WALL_LOOP_ASSIST;
     public static final ModConfigSpec.DoubleValue WALL_MAX_SPEED;
+
+    public static final ModConfigSpec.BooleanValue PLANE_ENABLED;
+    public static final ModConfigSpec.DoubleValue PLANE_SWITCH_MARGIN_G;
+    public static final ModConfigSpec.IntValue PLANE_DWELL_TICKS;
+    public static final ModConfigSpec.DoubleValue PLANE_HALF_LIFE;
+    public static final ModConfigSpec.DoubleValue PLANE_SLEW_DEG_PER_S;
 
     public static final ModConfigSpec.BooleanValue RELEASE_ENABLED;
     public static final ModConfigSpec.DoubleValue RELEASE_DECEL_G;
@@ -169,22 +159,21 @@ public final class CfConfig {
     public static final ModConfigSpec.BooleanValue HITBOX_ENABLED;
     public static final ModConfigSpec.DoubleValue HITBOX_AMOUNT;
     public static final ModConfigSpec.DoubleValue HITBOX_MAX_DEG;
+    public static final ModConfigSpec.BooleanValue HITBOX_CENTRE_PIVOT;
+    public static final ModConfigSpec.DoubleValue HITBOX_HALF_LIFE;
+    public static final ModConfigSpec.DoubleValue HITBOX_SLEW_DEG_PER_S;
 
     public static final ModConfigSpec.BooleanValue CAMERA_ENABLED;
     public static final ModConfigSpec.DoubleValue CAMERA_AMOUNT;
-    public static final ModConfigSpec.DoubleValue CAMERA_LEAN;
-    public static final ModConfigSpec.DoubleValue CAMERA_LEAN_MAX_DEG;
     public static final ModConfigSpec.DoubleValue CAMERA_RESPONSE;
     public static final ModConfigSpec.DoubleValue CAMERA_DAMPING;
-    public static final ModConfigSpec.DoubleValue CAMERA_SMOOTHING;
-    public static final ModConfigSpec.DoubleValue CAMERA_DEADBAND_DEG;
+    public static final ModConfigSpec.DoubleValue CAMERA_LEAD;
+    public static final ModConfigSpec.DoubleValue CAMERA_LEAN;
+    public static final ModConfigSpec.DoubleValue CAMERA_LEAN_MAX_DEG;
     public static final ModConfigSpec.DoubleValue CAMERA_PITCH_RESPONSE;
-    public static final ModConfigSpec.DoubleValue CAMERA_DECK_LEAN;
     public static final ModConfigSpec.DoubleValue CAMERA_MAX_TILT_DEG;
     public static final ModConfigSpec.DoubleValue CAMERA_SLEW_DEG_PER_S;
-    public static final ModConfigSpec.DoubleValue CAMERA_JOLT_GAIN;
     public static final ModConfigSpec.DoubleValue CAMERA_LOOP_SUPPRESSION;
-    public static final ModConfigSpec.DoubleValue CAMERA_WALK_DAMPING;
 
     public static final ModConfigSpec.BooleanValue DEBUG_OVERLAY;
     public static final ModConfigSpec.BooleanValue DEBUG_TEXT;
@@ -201,9 +190,11 @@ public final class CfConfig {
         b.comment("Fictitious forces of the sub-level you are standing on.",
                         "|a| = omega^2 * r: at 5 blocks radius you need ~2.5 rad/s (~24 rpm) to match",
                         "gravity, which is about what a real rotor ride spins at.",
-                        "On the FLOOR of a drum the centrifugal vector is horizontal, so it presses you",
-                        "into the floor by nothing and only pushes you outward. Sliding out to the wall",
-                        "is the ride, not a bug; the press appears once you reach the wall.")
+                        "The acceleration is built ANALYTICALLY from the sub-level's angular velocity",
+                        "and your radius - a_pivot + alpha x r + omega x (omega x r) - rather than by",
+                        "differencing the pose twice. One differentiation instead of two: the direction",
+                        "is exact by construction (it points at the axis), and the second-derivative",
+                        "noise that used to need a heavy filter simply is not produced.")
                 .push("centrifugal_force");
 
         CENTRIFUGAL_ENABLED = b.comment("/sable_cf centrifugal_force enable|disable")
@@ -213,11 +204,20 @@ public final class CfConfig {
                 .comment("The one knob. 1.0 is the physical value. /sable_cf centrifugal_force <value>")
                 .defineInRange("strength", 1.0, 0.0, 4.0);
 
+        CENTRIFUGAL_LEAD = b
+                .comment("Phase lead on the measured angular velocity, in ticks.",
+                        "A backward difference of the pose is centred half a tick in the past, and",
+                        "Sable's own velocity field is another half behind that. Extrapolating omega",
+                        "forward by this many ticks removes the residual, which is what stopped the",
+                        "debug arrows pointing a few degrees off to the side. 0 disables it; above ~1.5",
+                        "it starts amplifying network jitter instead of cancelling lag.")
+                .defineInRange("lead_ticks", 1.0, 0.0, 3.0);
+
         CORIOLIS_STRENGTH = b
                 .comment("Scale on -2 omega x v, the term driven by your own walking. Full strength is",
                         "correct but reads as a mysterious sideways pull, and Sure Footing already",
                         "rotates your velocity with the frame, which cancels most of it.")
-                .defineInRange("coriolis_strength", 0.3, 0.0, 2.0);
+                .defineInRange("coriolis_strength", 0.25, 0.0, 2.0);
 
         MAX_ACCEL_G = b
                 .comment("Hard clamp on everything this mod adds, in g. A safety rail, not a knob: a",
@@ -226,47 +226,52 @@ public final class CfConfig {
 
         b.pop();
 
-        b.comment("Getting peeled off. The ONLY thing in the mod that slides you off a contraption.",
-                        "There used to be a second knob called 'slip' doing half the same job, so",
-                        "switching air resistance off did not stop you sliding. It is one idea, so it is",
-                        "one section, in two parts:",
-                        "  strength - the headwind. Pinned in a drum you are carried through still air at",
-                        "             omega x r, and that is what makes holding on a thing you DO.",
+        b.comment("Getting peeled off. The ONLY thing in the mod that takes you off a contraption.",
+                        "Everything else holds you on, so this is the difficulty knob and the reason",
+                        "wall walking is not free:",
+                        "  strength - the headwind. Pinned in a drum you are carried through still air",
+                        "             at omega x r, and that is what makes holding on a thing you DO.",
                         "             Measured against the air the sub-level carries: the rigid",
-                        "             translation is subtracted, so a deck cruising at 25 m/s is not a gale",
-                        "             for someone standing on it. Rotation survives, translation cancels.",
-                        "  slide    - the outward creep. Friction is symmetric, so once it holds you it",
-                        "             holds you exactly where you are and the ride never moves you to the",
-                        "             rim. This is what walks you out to the wall.",
-                        "Set this to 0 and wall walking becomes effortless. That is the difficulty knob.")
+                        "             translation is subtracted, so a deck cruising at 25 m/s is not a",
+                        "             gale for someone standing on it. Rotation survives, translation",
+                        "             cancels identically.",
+                        "  slide    - a shear the ride adds on top, as a fraction of the surface-",
+                        "             tangential centrifugal load. Friction is symmetric, so without it",
+                        "             the ride never walks you out to the rim.",
+                        "Set both to 0 and wall walking becomes effortless: you stick and stay stuck.")
                 .push("air_resistance");
 
         AIR_ENABLED = b
                 .comment("/sable_cf air_resistance enable|disable. Off stops BOTH the headwind and the",
-                        "creep, so it really does mean 'nothing peels me off'.")
+                        "shear, so it really does mean 'nothing peels me off'.")
                 .define("enabled", true);
 
         AIR_STRENGTH = b.comment("The one knob. /sable_cf air_resistance <value>")
                 .defineInRange("strength", 1.0, 0.0, 4.0);
 
         AIR_SLIDE = b
-                .comment("Fraction of the surface-tangential centrifugal load let past friction as",
-                        "outward creep. 0.30 is a slow drift you can walk against. 0 removes it.")
-                .defineInRange("slide", 0.30, 0.0, 2.0);
+                .comment("Fraction of the surface-tangential centrifugal load added as outward shear.",
+                        "0.25 is a drift you can walk against. 0 removes it.")
+                .defineInRange("slide", 0.25, 0.0, 2.0);
 
         AIR_SLIDE_MAX_SPEED = b
-                .comment("Cap on the creep, m/s. It fades as you approach this, so it settles at a",
-                        "terminal drift instead of clipping at one.")
-                .defineInRange("slide_max_speed", 2.2, 0.1, 20.0);
+                .comment("Reference speed, m/s, for the viscous term that gives a slide its terminal",
+                        "drift. This is NOT a clip: the drag rises with speed and the slide settles",
+                        "where push equals drag, which is why it now feels like sliding rather than",
+                        "like hitting an invisible rail.")
+                .defineInRange("slide_max_speed", 2.6, 0.1, 20.0);
 
         b.pop();
 
-        b.comment("Footing: how much sideways load your feet hold before you slide.",
-                        "Raised hard from the old 1.15. At 1.15 any contraption that turned briskly beat",
-                        "friction, and because the excess was applied every tick with nothing observing",
-                        "the resulting slide, one turn started a slide that never stopped. Two separate",
-                        "fixes: grip decides WHETHER you move, slide_cap_g and the speed limit decide how",
-                        "hard and how far - so a sharp turn shoves you instead of evicting you.")
+        b.comment("Footing. ONE Coulomb solve, and gravity is inside it.",
+                        "That is the fix for sliding feeling arbitrary. The old solve fed friction only",
+                        "the fictitious terms, so the pull of gravity along a wall was never something",
+                        "your feet resisted - it was applied by vanilla behind the model's back, and",
+                        "the only way to stop being dragged was to raise grip until the gate never",
+                        "opened at all. Now the tangential load is (1 - stick) * gravity + ride + drag",
+                        "+ coriolis, friction holds up to grip * press of it, the held part is CANCELLED",
+                        "(that is what standing means), and only the excess moves you - against a",
+                        "viscous term, so a slide has a terminal speed instead of an accelerating one.")
                 .push("grip");
 
         GRIP_ENABLED = b.comment("/sable_cf grip enable|disable. Off means everything slides.")
@@ -274,92 +279,125 @@ public final class CfConfig {
 
         GRIP_STRENGTH = b
                 .comment("The one knob: static friction coefficient. /sable_cf grip <value>",
-                        "2.2 is well above a realistic boot-on-metal 0.85, on purpose. This is the number",
-                        "that decides whether a deck yanking sideways takes you with it, and being thrown",
-                        "off something you were standing on is the least fun outcome available.")
-                .defineInRange("strength", 2.2, 0.0, 8.0);
+                        "1.2 rather than the old 2.2. The old value was propping up a broken solve -",
+                        "it had to be absurd because the gate was the only thing standing between you",
+                        "and an unbounded push. With gravity inside the solve and a terminal speed on",
+                        "the outside, a boot-like coefficient behaves the way a boot does.")
+                .defineInRange("strength", 1.2, 0.0, 8.0);
 
         GRIP_BRACE_BONUS = b
                 .comment("Friction multiplier while sneaking - the 'hold on' input.")
-                .defineInRange("brace_bonus", 1.9, 1.0, 4.0);
+                .defineInRange("brace_bonus", 1.8, 1.0, 4.0);
 
         GRIP_MIN_PRESS_G = b
-                .comment("Press, in g, below which a surface is not holding you. Bottom of the lean ramp.")
-                .defineInRange("min_press_g", 0.2, 0.0, 4.0);
+                .comment("Press, in g, below which a surface is not holding you at all.")
+                .defineInRange("min_press_g", 0.12, 0.0, 4.0);
 
         GRIP_FULL_PRESS_G = b
-                .comment("Press, in g, at which the surface holds you completely. Top of the lean ramp,",
-                        "bottom of the wall-climb ramp. 0.8 rather than 1.0: a homemade drum will not",
-                        "spin at rotor-ride speeds, and an effect you cannot reach is not a feature.")
-                .defineInRange("full_press_g", 0.8, 0.1, 16.0);
+                .comment("Press, in g, at which a surface holds you completely.")
+                .defineInRange("full_press_g", 0.55, 0.05, 16.0);
+
+        GRIP_SLIDE_DAMPING = b
+                .comment("Viscous damping on an active slide, 1/s. THE number that decides how a slide",
+                        "feels. Terminal speed is roughly excess / damping, so 1.6 turns a 1 g excess",
+                        "into about 20 m/s of eventual drift and a realistic 0.2 g excess into 4 m/s.",
+                        "Raise it for a syrupy, controllable creep; lower it for ice.")
+                .defineInRange("slide_damping", 1.6, 0.05, 20.0);
 
         GRIP_SLIDE_CAP_G = b
-                .comment("Most acceleration a slide may ever have, in g. The gameplay rail. Without it",
-                        "the excess past friction is unbounded and a contraption snapping sideways does",
-                        "not slide you, it deletes you from the deck.")
-                .defineInRange("slide_cap_g", 1.1, 0.05, 16.0);
-
-        ATTACH_PRESS_G = b
-                .comment("Press, in g, at which touching a surface sideways latches you to it.")
-                .defineInRange("attach_press_g", 0.45, 0.05, 16.0);
-
-        ATTACH_RELEASE_G = b
-                .comment("Press, in g, below which an attached player lets go. Lower than attach on",
-                        "purpose: that gap is hysteresis. Jumping always releases.")
-                .defineInRange("release_press_g", 0.25, 0.0, 16.0);
-
-        ATTACH_SHARE = b
-                .comment("Fraction of the press into a surface that must come from the RIDE rather than",
-                        "gravity before it can latch. The 'only in the right scenarios' rule, and what",
-                        "makes the check safe on any orientation: an ordinary floor is pressed by gravity",
-                        "so its share is near zero and it can never latch, while the inside of a drum is",
-                        "near one whether it is beside you, below you or above you at the top of a loop.")
-                .defineInRange("attach_share", 0.45, 0.0, 1.0);
-
-        ATTACH_ADHESION_G = b
-                .comment("Extra acceleration into the surface while attached, in g. Small on purpose:",
-                        "Sable resolves contact in a few substeps, so a body exactly touching a moving",
-                        "wall drifts off it and back every tick. This keeps the contact closed. It is not",
-                        "what holds you up - that is friction.")
-                .defineInRange("adhesion_g", 0.35, 0.0, 4.0);
+                .comment("Most acceleration a slide may ever have, in g. A rail for the pathological",
+                        "case, not a tuning knob: a contraption snapping sideways should shove you, not",
+                        "delete you from the deck.")
+                .defineInRange("slide_cap_g", 1.4, 0.05, 16.0);
 
         b.pop();
 
-        b.comment("Wall walking. The mod is fundamentally about this.",
-                        "Two things must be true before a wall behaves like a floor, and only one of them",
-                        "used to be here:",
-                        "  1. the along-surface pull of gravity is cancelled, in proportion to how hard",
-                        "     the RIDE presses you in - a rider in a real rotor walks up the drum because",
-                        "     press gives their boots the friction to beat gravity;",
-                        "  2. the walk keys actually drive you ALONG the surface. Without this the first",
-                        "     one only buys the right to hover: you press W, Minecraft pushes you",
-                        "     horizontally into the wall, and nothing happens.",
-                        "Rotation-gated and share-gated, so an ordinary wall is still a wall.")
+        b.comment("Wall walking. The mod is fundamentally about this, and it is one number: stick.",
+                        "stick is 0..1, how much of the apparent load the ride is holding for you:",
+                        "  * the along-surface part is cancelled, so you can walk up a drum;",
+                        "  * the pulling-off part is cancelled, so you can hang under the deck at the",
+                        "    top of a loop.",
+                        "The remaining (1 - stick) goes through friction like anything else. stick comes",
+                        "from the RIDE's own press, and - separately - from the mere fact of being on a",
+                        "rotating deck (loop_assist), which is what lets a slow 360 carry you round when",
+                        "the physical press alone would not. Rotation-gated, so an ordinary wall on an",
+                        "ordinary contraption is still an ordinary wall.")
                 .push("wall");
 
         WALL_ENABLED = b.comment("/sable_cf wall enable|disable").define("enabled", true);
 
         WALL_STRENGTH = b
-                .comment("The one knob. /sable_cf wall <value>. Scales the gravity cancellation and the",
-                        "walk drive together, because they are one mechanic.")
+                .comment("The one knob. /sable_cf wall <value>. Scales stick as a whole.")
                 .defineInRange("strength", 1.0, 0.0, 2.0);
 
-        WALL_PRESS_G = b
+        WALL_MIN_PRESS_G = b
+                .comment("Centrifugal press, in g, at which the ride starts holding you.")
+                .defineInRange("min_press_g", 0.20, 0.0, 16.0);
+
+        WALL_FULL_PRESS_G = b
                 .comment("Centrifugal press, in g, at which the surface handles exactly like a floor.",
-                        "Ramps from grip.full_press_g to here, and the WIDTH is the point: press on a real",
-                        "drum wanders by a few m/s^2 tick to tick, so a narrow band is a switch with noise",
+                        "Ramps from min_press_g, and the WIDTH is the point: press on a real drum",
+                        "wanders by a few m/s^2 tick to tick, so a narrow band is a switch with noise",
                         "on it and the assist snaps on and off several times a second.")
-                .defineInRange("press_g", 1.3, 0.2, 16.0);
+                .defineInRange("full_press_g", 0.90, 0.1, 16.0);
+
+        WALL_LOOP_ASSIST = b
+                .comment("How much stick a rotating deck grants on contact alone, 0..1, before any",
+                        "press is measured. This is the gameplay grant that makes 'solnyshko' work: a",
+                        "gentle 360 does not generate a gravity's worth of centrifugal force anywhere",
+                        "in the loop, so on physics alone you fall off at the top. At 0.85 the ride",
+                        "holds 85% of the load and air resistance walks you slowly down the deck - you",
+                        "drift, but you complete the loop. Set 0 for a purely physical ride.")
+                .defineInRange("loop_assist", 0.85, 0.0, 1.0);
 
         WALL_MAX_SPEED = b
-                .comment("How fast the assist may carry you along the surface, m/s.")
-                .defineInRange("max_speed", 3.4, 0.1, 12.0);
+                .comment("How fast the walk assist may carry you along the surface, m/s.")
+                .defineInRange("max_speed", 4.0, 0.1, 12.0);
+
+        b.pop();
+
+        b.comment("Which way is down. The gravity plane is picked DISCRETELY from the sub-level's six",
+                        "local faces and committed with hysteresis, instead of being blended.",
+                        "Blending was the cause of two separate bugs and neither was tuning:",
+                        "  * in the corner where floor meets wall the blended normal is diagonal, so",
+                        "    projecting gravity onto it produced a large UPWARD vector - being lifted",
+                        "    and shaken on the way onto a wall;",
+                        "  * a blended normal points where no face of the contraption points, so the",
+                        "    body could never be square to the grid the way Sure Footing keeps it.",
+                        "A committed plane is one of exactly six directions, so on a level deck the",
+                        "rotation is identity - not 'small', identity - and on a 360 ride it simply",
+                        "travels with the deck all the way round.")
+                .push("plane");
+
+        PLANE_ENABLED = b
+                .comment("Off keeps the body upright and leaves only the forces. Debug aid.")
+                .define("enabled", true);
+
+        PLANE_SWITCH_MARGIN_G = b
+                .comment("How much more support, in g, a rival face needs before it takes over.",
+                        "This is the hysteresis, and it is why the handover is crisp rather than",
+                        "flickering: the face you are on keeps the plane until another one is clearly",
+                        "better, then the switch happens once.")
+                .defineInRange("switch_margin_g", 0.22, 0.0, 4.0);
+
+        PLANE_DWELL_TICKS = b
+                .comment("How many consecutive ticks a rival must stay ahead before it is committed.",
+                        "Margin alone can still be beaten by a single noisy tick; a dwell cannot.")
+                .defineInRange("dwell_ticks", 3, 0, 40);
+
+        PLANE_HALF_LIFE = b
+                .comment("Half-life, s, of the body rotating onto a newly committed plane.")
+                .defineInRange("half_life", 0.13, 0.01, 2.0);
+
+        PLANE_SLEW_DEG_PER_S = b
+                .comment("Cap on how fast the body may turn, deg/s.")
+                .defineInRange("slew_deg_per_s", 400.0, 30.0, 2880.0);
 
         b.pop();
 
         b.comment("Release: the contraption stops but you do not. A lift rising with you on it jams",
                         "against a frame; you were doing 8 m/s upward, so you keep going out through the",
-                        "middle. Only ever applies to a player who was ALREADY attached.")
+                        "middle. Only ever applies to a player the ride was ALREADY holding.")
                 .push("release");
 
         RELEASE_ENABLED = b.comment("/sable_cf release enable|disable").define("enabled", true);
@@ -375,50 +413,59 @@ public final class CfConfig {
         b.pop();
 
         b.comment("Rotating the player's collision box.",
-                        "Sable already snaps the box YAW to the sub-level grid by itself - that is the",
-                        "Sure Footing behaviour, square to the contraption rather than to the world, and",
-                        "it costs this mod nothing. This section is only the LEAN on top of it.",
-                        "Read max_deg before changing anything. Sable turns the box about the player's",
-                        "EYE, not their feet, so a lean of A degrees sweeps the feet sideways by",
-                        "2 * 1.62 * sin(A/2) blocks: 0.28 at 10 deg, 0.97 at 35, 2.3 at 90. Beside a wall",
-                        "that displacement IS a penetration, SAT returns it as a minimum translation",
-                        "vector, and Sable's near-vertical branch redirects the whole length along your",
-                        "body up. That is exactly 'I tried to get on the wall and it spat me through it'.",
-                        "So the lean is capped, slewed slowly, and clearance-tested against real voxels",
-                        "before it is handed over - it can never rotate into geometry.",
-                        "You do not need a big lean to stand on a wall: an upright box pressed against one",
-                        "occupies free space. What makes it FEEL like standing is the camera and the wall",
-                        "section, not the box.")
+                        "Sable already snaps the box YAW to the sub-level grid by itself - the Sure",
+                        "Footing behaviour, square to the contraption rather than to the world. This",
+                        "section is only the LEAN on top of it.",
+                        "Read centre_pivot before touching max_deg. Stock Sable turns the box about the",
+                        "player's EYE, and that is what used to fire people through walls: a lean of A",
+                        "degrees slides the box sideways by 2 * 0.72 * sin(A/2) blocks, SAT returns that",
+                        "displacement as a minimum translation vector, and Sable's near-vertical branch",
+                        "redirects the whole length along your body up. centre_pivot moves the pivot to",
+                        "the body's own centre, where a rotation displaces nothing at all - which is",
+                        "also why a 360 ride can now rotate the box the whole way round safely: nothing",
+                        "moves relative to the deck, so there is nothing to resolve.")
                 .push("hitbox");
 
         HITBOX_ENABLED = b
-                .comment("/sable_cf hitbox enable|disable. Off keeps Sable's grid yaw and loses only the",
-                        "lean.")
+                .comment("/sable_cf hitbox enable|disable. Off keeps Sable's grid yaw and loses only",
+                        "the lean.")
                 .define("enabled", true);
 
         HITBOX_AMOUNT = b
-                .comment("How much of the body lean the box follows, 0..1, before the cap.",
-                        "/sable_cf hitbox <value>")
+                .comment("How much of the body lean the box follows, 0..1. /sable_cf hitbox <value>")
                 .defineInRange("amount", 1.0, 0.0, 1.0);
 
+        HITBOX_CENTRE_PIVOT = b
+                .comment("Rotate the collision box about the body's centre instead of the eye.",
+                        "Implemented by cancelling one Sable method; if that mixin ever fails to apply",
+                        "the box quietly goes back to the eye pivot and max_deg is what saves you, so",
+                        "the cap is still enforced.")
+                .define("centre_pivot", true);
+
         HITBOX_MAX_DEG = b
-                .comment("Hard cap on the collision lean, degrees. THE safety number in this mod.",
-                        "25 keeps the worst-case foot sweep near 0.7 blocks, which the clearance test can",
-                        "still refuse cleanly. Raise it and you trade 'my body looks right' against 'I get",
-                        "flung when I lean near geometry'. The eye pivot is upstream ask #2 in",
-                        "docs/UPSTREAM.md and this cap disappears the day it becomes a feet pivot.")
-                .defineInRange("max_deg", 25.0, 0.0, 180.0);
+                .comment("Hard cap on the collision lean, degrees. 180 = no cap; the clearance test",
+                        "against real voxels is the real limiter and it can refuse a posture outright.",
+                        "Lower this to about 25 if you turn centre_pivot off.")
+                .defineInRange("max_deg", 180.0, 0.0, 180.0);
+
+        HITBOX_HALF_LIFE = b
+                .comment("Half-life, s, of the collision box chasing the body. Slightly slower than",
+                        "the body so the view leads and the box follows, which reads as weight.")
+                .defineInRange("half_life", 0.18, 0.01, 2.0);
+
+        HITBOX_SLEW_DEG_PER_S = b
+                .comment("Cap on how fast the collision box may turn, deg/s.")
+                .defineInRange("slew_deg_per_s", 260.0, 10.0, 2880.0);
 
         b.pop();
 
         b.comment("Camera. Requires Aeronautics Camera Sync with addTiltSource().",
-                        "Aimed at the BODY orientation plus a small CAPPED lean towards felt gravity.",
-                        "The cap is the fix for 'it heels over violently on turns'. Leaning towards felt",
-                        "gravity is right, but the angle it asks for is unbounded: a brisk turn produces",
-                        "several g sideways and asks for 60-70 degrees of roll, which is nobody's idea of",
-                        "a bank. lean_max_deg makes that a fixed small readable tilt while leaving the",
-                        "RESPONSE - how fast it gets there - untouched, which is the part that actually",
-                        "reads as reactive.")
+                        "The target is the COMMITTED gravity plane, scaled by stick - a discrete",
+                        "direction times a smooth scalar. That matters more than any of the numbers",
+                        "below: the old target was a blend of a filtered force, a felt-gravity lean and",
+                        "a surface normal, so it jittered at source and every setting here was really a",
+                        "way of hiding that. It cannot jitter now, so the spring is allowed to be fast,",
+                        "and the dead band that used to be needed to kill the tremble is gone.")
                 .push("camera");
 
         CAMERA_ENABLED = b.comment("/sable_cf camera enable|disable").define("enabled", true);
@@ -428,79 +475,59 @@ public final class CfConfig {
                         "level while everything else still works.")
                 .defineInRange("amount", 1.0, 0.0, 2.0);
 
+        CAMERA_RESPONSE = b
+                .comment("Spring frequency, rad/s. 9.0 settles in about a quarter of a second - brisk.",
+                        "Safe to be this high only because the target no longer carries noise.")
+                .defineInRange("response", 9.0, 1.0, 40.0);
+
+        CAMERA_DAMPING = b
+                .comment("Damping ratio. 1.0 is critical: the fastest approach that cannot overshoot,",
+                        "which is the mathematical answer to 'snappy and smooth at the same time'.",
+                        "Below 1 it will visibly bounce.")
+                .defineInRange("damping", 1.0, 0.4, 2.0);
+
+        CAMERA_LEAD = b
+                .comment("How far ahead the camera aims, in seconds of the deck's own rotation, 0..0.25.",
+                        "A spring always trails its target; leading the target by omega * lead cancels",
+                        "most of that instead of stiffening the spring, so the view meets a plane change",
+                        "rather than chasing it. This is the setting that makes it feel eager rather",
+                        "than merely fast.")
+                .defineInRange("lead", 0.07, 0.0, 0.25);
+
         CAMERA_LEAN = b
-                .comment("Fraction of the angle to felt gravity the view leans on top of following the",
-                        "body, 0..1, then capped by lean_max_deg. This is the term that makes a change of",
-                        "direction felt when you are NOT pinned, so it should not be zero.")
-                .defineInRange("lean", 0.35, 0.0, 1.0);
+                .comment("Fraction of the angle to felt gravity the view leans on top of the plane,",
+                        "0..1, then capped by lean_max_deg. This is what makes a change of direction",
+                        "felt when you are NOT pinned, so it should not be zero.")
+                .defineInRange("lean", 0.30, 0.0, 1.0);
 
         CAMERA_LEAN_MAX_DEG = b
                 .comment("Hard cap on that lean, degrees. Raise if turns feel numb, lower if they feel",
-                        "sickening. It does NOT limit standing on a wall - that comes from the body and is",
-                        "bounded by max_tilt_deg instead.")
-                .defineInRange("lean_max_deg", 12.0, 0.0, 90.0);
-
-        CAMERA_RESPONSE = b
-                .comment("Base spring frequency, rad/s. 4.5 settles in about 0.45 s.")
-                .defineInRange("response", 4.5, 1.0, 40.0);
-
-        CAMERA_DAMPING = b
-                .comment("Damping ratio. 1.05 is a shade past critical: fastest approach with no",
-                        "overshoot and a little margin so a spike cannot make it ring.")
-                .defineInRange("damping", 1.05, 0.4, 2.0);
-
-        CAMERA_SMOOTHING = b
-                .comment("Half-life, s, of the low-pass on the camera's TARGET, not on the camera.",
-                        "Filtering the target is what makes this gentle without making it late.")
-                .defineInRange("smoothing", 0.14, 0.0, 1.0);
-
-        CAMERA_DEADBAND_DEG = b
-                .comment("Jitter dead zone, degrees, for micro-tremble. Applied as slop, not a step.")
-                .defineInRange("deadband_deg", 0.7, 0.0, 10.0);
-
-        CAMERA_JOLT_GAIN = b
-                .comment("How much a CHANGE OF DIRECTION speeds the camera up. Speeds it UP - it does not",
-                        "lean it further. That separation is deliberate: 'reactive' is a question about",
-                        "time, and answering it with amplitude is what made turns nauseating.",
-                        "Driven by how fast the target is swinging plus a little angular acceleration, so",
-                        "it is large when the ride changes what it is doing and zero when it is doing the",
-                        "same thing quickly. Curve is x/(1+x): monotonic, bounded, cannot spike.")
-                .defineInRange("jolt_gain", 0.9, 0.0, 6.0);
-
-        CAMERA_LOOP_SUPPRESSION = b
-                .comment("How much to stop following the target once the sub-level goes all the way",
-                        "round, 0..1. In a loop the body up sweeps a full circle and a camera that tracks",
-                        "it honestly rolls 360 degrees - the most nauseating thing a camera can do, and",
-                        "not what a human does: you keep your head with your body and let the world go",
-                        "round you.")
-                .defineInRange("loop_suppression", 0.85, 0.0, 1.0);
-
-        CAMERA_WALK_DAMPING = b
-                .comment("How much to calm the camera while you move across the deck, 0..1. Walking on a",
-                        "spinner changes your radius every tick, so the target moves even though the ride",
-                        "is doing nothing new. Only ever damps.")
-                .defineInRange("walk_damping", 0.6, 0.0, 1.0);
+                        "sickening. It does NOT limit standing on a wall - that comes from the plane",
+                        "and is bounded by max_tilt_deg instead.")
+                .defineInRange("lean_max_deg", 10.0, 0.0, 90.0);
 
         CAMERA_PITCH_RESPONSE = b
                 .comment("How much of the pitch component to apply, 0..1. Roll is well tolerated; pitch",
                         "is what makes people queasy. Yaw is dropped entirely.")
-                .defineInRange("pitch_response", 0.7, 0.0, 1.0);
-
-        CAMERA_DECK_LEAN = b
-                .comment("Small blend towards the geometric surface normal, 0..1 - the proprioceptive",
-                        "hint that tells you which way the floor is. Keep it small.")
-                .defineInRange("deck_lean", 0.08, 0.0, 1.0);
+                .defineInRange("pitch_response", 0.8, 0.0, 1.0);
 
         CAMERA_MAX_TILT_DEG = b
-                .comment("Hard cap on total tilt, degrees. 95 so being genuinely pinned to a drum wall -",
-                        "or under the deck at the top of a loop - can be shown. Short of 180, where a",
-                        "rotation vector has no defined axis.")
-                .defineInRange("max_tilt_deg", 95.0, 0.0, 150.0);
+                .comment("Hard cap on total tilt, degrees. 170 so being pinned to a drum wall - or",
+                        "hanging under the deck at the top of a loop - can be shown honestly. Short of",
+                        "180, where a rotation vector has no defined axis.")
+                .defineInRange("max_tilt_deg", 170.0, 0.0, 179.0);
 
         CAMERA_SLEW_DEG_PER_S = b
                 .comment("Cap on how fast the camera may turn, deg/s. For the pathological case - a",
                         "contraption that snaps 180 degrees in one tick.")
-                .defineInRange("slew_deg_per_s", 200.0, 30.0, 1440.0);
+                .defineInRange("slew_deg_per_s", 420.0, 30.0, 1440.0);
+
+        CAMERA_LOOP_SUPPRESSION = b
+                .comment("How much to stop following the plane once the deck goes all the way round,",
+                        "0..1. DEFAULT 0 - off. It used to be 0.85, which meant the one ride the mod",
+                        "exists for was the one ride the camera refused to show you. Turn it up if",
+                        "full inversions make you ill; it costs you the loop, not the physics.")
+                .defineInRange("loop_suppression", 0.0, 0.0, 1.0);
 
         b.pop();
 
@@ -527,7 +554,7 @@ public final class CfConfig {
                 .defineInRange("alpha", 0.7, 0.05, 1.0);
 
         DEBUG_SMOOTHING_MS = b.comment("Half-life of the arrow smoothing, milliseconds.")
-                .defineInRange("smoothing_ms", 70, 0, 1000);
+                .defineInRange("smoothing_ms", 45, 0, 1000);
 
         b.pop();
 
@@ -552,30 +579,50 @@ public final class CfConfig {
         return (raw / (1.0 + raw / AIR_SOFT_CAP_G)) * GRAVITY;
     }
 
-    /** The lean ramp from press alone: 0 while barely pressed, 1 once firmly pressed. */
-    public static double tiltFromPress(final double press) {
-        return smoothstep(press, GRIP_MIN_PRESS_G.get() * GRAVITY, GRIP_FULL_PRESS_G.get() * GRAVITY);
-    }
-
-    /** How much of the wall assist the ride has earned, 0..1, from its share of the normal load. */
-    public static double climbWeight(final double share) {
-        return smoothstep(share, CLIMB_SHARE_LOW, CLIMB_SHARE_HIGH);
-    }
-
     /**
      * How much rotation-specific behaviour applies at this spin rate, 0..1.
      *
-     * <p>Attach, creep and climb are features of a SPINNING ride. Gating them on angular velocity
-     * is what guarantees a lift or a ship under way can never trigger them however it is thrown
-     * about - structural, not a tuning question.</p>
+     * <p>The plane, the stick and the climb are features of a SPINNING ride. Gating them on angular
+     * velocity is what guarantees a lift or a ship under way can never trigger them however it is
+     * thrown about - structural, not a tuning question.</p>
      */
     public static double spinGate(final double spin) {
         return smoothstep(spin, SPIN_DEADZONE, SPIN_FULL);
     }
 
-    /** Dead-zone fade for the frame acceleration, 0..1. Anti-noise only. */
-    public static double frameAccelGate(final double magnitude) {
-        return smoothstep(magnitude, FRAME_ACCEL_DEADZONE_G * GRAVITY, FRAME_ACCEL_FULL_G * GRAVITY);
+    /** Dead-zone fade for the contraption's LINEAR acceleration, 0..1. Anti-noise only. */
+    public static double linearAccelGate(final double magnitude) {
+        return smoothstep(magnitude, LINEAR_ACCEL_DEADZONE_G * GRAVITY, LINEAR_ACCEL_FULL_G * GRAVITY);
+    }
+
+    /** How firmly the ride is holding you to the committed plane, 0..1. */
+    public static double stick(final double ridePress, final double spinGate) {
+        if (!WALL_ENABLED.get() || spinGate <= 0.0) {
+            return 0.0;
+        }
+
+        final double physical = smoothstep(ridePress,
+                WALL_MIN_PRESS_G.get() * GRAVITY, WALL_FULL_PRESS_G.get() * GRAVITY);
+
+        // The grant and the physical press do not add: the ride either holds you because it is
+        // flinging you into the surface, or because this is a ride and rides carry their riders.
+        // Whichever is larger is the honest answer, and taking the max keeps the curve monotonic.
+        final double granted = WALL_LOOP_ASSIST.get();
+
+        return clamp01(Math.max(physical, granted) * spinGate * WALL_STRENGTH.get());
+    }
+
+    /** How much footing a press buys, 0..1. Used for reporting and for the friction ramp. */
+    public static double footing(final double press) {
+        return smoothstep(press, GRIP_MIN_PRESS_G.get() * GRAVITY, GRIP_FULL_PRESS_G.get() * GRAVITY);
+    }
+
+    public static double clamp01(final double value) {
+        if (!Double.isFinite(value)) {
+            return 0.0;
+        }
+
+        return Math.min(1.0, Math.max(0.0, value));
     }
 
     /** Smoothstep with zero slope at both ends, so nothing snaps on entry or exit. */
