@@ -20,49 +20,51 @@ import org.joml.Vector3f;
  * <p>This used to aim straight at felt gravity. That sounds right - balance tracks gravity - but it
  * produces a camera that rolls the entire centrifugal angle on every bank while the body it belongs
  * to stands bolt upright. A great deal of motion, none of it corresponding to anything the
- * character is doing, and it heels hardest exactly when you are least pinned. That is the "why is
- * it leaning so far" problem, and no amount of damping fixes it, because the target itself was
- * wrong.</p>
+ * character is doing, and it heels hardest exactly when you are least pinned.</p>
  *
  * <p>So the target is the <b>body's</b> up direction, computed once in {@code BodyFrame} and shared
  * with the hitbox. Three things follow, none of them tuned:</p>
  *
  * <ul>
  *   <li>An ordinary deck - moving, accelerating, sloped, banking gently - rotates the body by
- *       nothing, because the body tilt is gated on the ride's share of the press. So the camera
- *       does nothing either.</li>
+ *       nothing, because the body only leans when felt gravity has genuinely left world gravity and
+ *       there is a non-floor face under it. So the camera does nothing either.</li>
  *   <li>A drum that genuinely pins you rotates body and camera together, so standing on the wall
  *       looks like standing on the wall rather than like the world falling over.</li>
- *   <li>The view and the hitbox cannot disagree, because there is one orientation and both read
- *       it.</li>
+ *   <li>The view and the hitbox cannot disagree, because there is one body orientation and both
+ *       are derived from it.</li>
  * </ul>
  *
- * <p>A small, explicit lean towards felt gravity is added on top. With the body as the target that
- * term is the only thing left that moves the view when you are not pinned, so it is what stops a
- * change of direction from going numb - which is the other half of what was wanted.</p>
+ * <h2>The lean, and why it is capped in degrees</h2>
+ *
+ * <p>A small explicit lean towards felt gravity is added on top. With the body as the target that
+ * term is the only thing left that moves the view when you are <i>not</i> pinned, so it is what
+ * stops a change of direction from going numb.</p>
+ *
+ * <p>It is clamped in absolute degrees rather than by its fraction, and that is the fix for turns
+ * heeling over sickeningly. The angle a fraction scales is unbounded: a brisk turn puts felt
+ * gravity 60 or 70 degrees off world up, and a quarter of that is still a violent roll. Turning the
+ * fraction down far enough to tame the worst case also removed the response on the gentle changes
+ * that were already pleasant. A cap keeps the small ones exactly as they were and saturates the
+ * large ones.</p>
  *
  * <h2>Gentle, but not numb</h2>
  *
- * <p>Two separate problems, and conflating them is why this was hard to tune:</p>
- *
  * <ul>
- *   <li><b>Tremble.</b> The pose arrives over the network, so the target is never perfectly still,
- *       and a camera that tracks it faithfully never stops twitching. Fixed by filtering the
- *       <i>target</i> and applying a dead band to it - not by slowing the camera down, which would
- *       have cost the response as well.</li>
+ *   <li><b>Tremble.</b> The pose arrives over the network, so the target is never perfectly still.
+ *       Fixed by filtering the <i>target</i> and applying a dead band to it - not by slowing the
+ *       camera, which would have cost the response as well.</li>
  *   <li><b>Response.</b> Driven by how fast the target is swinging, rather than by the magnitude of
  *       the centrifugal vector. Magnitude is {@code omega^2 * r}: it grows with radius and with
  *       perfectly steady spin, so it reads large when nothing is happening and small for a genuine
- *       flick near the axis, which is exactly the "sometimes too much, sometimes nothing"
- *       instability.</li>
+ *       flick near the axis - exactly the "sometimes too much, sometimes nothing" instability.</li>
  * </ul>
  *
  * <h2>Three different signals, not one</h2>
  *
  * <ol>
  *   <li><b>A loop.</b> The body's up sweeps a full circle, so a camera that follows it honestly
- *       rolls 360 degrees - the single most nauseating thing a camera can do, and not what a human
- *       does either. Detected by the <i>horizontal</i> component of the sub-level's angular
+ *       rolls 360 degrees. Detected by the <i>horizontal</i> component of the sub-level's angular
  *       velocity: a banked turn yaws about a vertical axis and is left alone, a flip rotates about
  *       a horizontal one. When detected, the target fades to a running average whose window tracks
  *       the revolution period.</li>
@@ -152,21 +154,7 @@ public final class CfTiltSource implements TiltSource {
 
             up.normalize();
 
-            // The small deliberate lean towards felt gravity. Coriolis is excluded because it is
-            // the only term produced by the player's own walking rather than by the ride, and
-            // leaving it in meant every step changed where down was.
-            final Vector3d feltUp = new Vector3d(state.apparent).sub(state.coriolis).negate();
-
-            if (feltUp.lengthSquared() > 1.0e-9 && feltUp.isFinite()) {
-                feltUp.normalize();
-                up.lerp(feltUp, CfConfig.CAMERA_FELT_LEAN);
-
-                if (up.lengthSquared() < 1.0e-9 || !up.isFinite()) {
-                    up.set(0.0, 1.0, 0.0);
-                } else {
-                    up.normalize();
-                }
-            }
+            applyLean(up, state);
 
             this.updateTurnRate(up, dt);
 
@@ -234,11 +222,56 @@ public final class CfTiltSource implements TiltSource {
     }
 
     /**
+     * Leans the target towards felt gravity, by a fraction, capped in absolute degrees.
+     *
+     * <p>The cap is the whole point. A fraction of an unbounded angle is still unbounded, and the
+     * angle here reaches 60 or 70 degrees on a brisk turn - which is where "the camera heels over
+     * horribly on turns" came from. Capping in degrees leaves gentle changes scaled exactly as they
+     * were and saturates the violent ones.</p>
+     *
+     * <p>Coriolis is excluded because it is the only term produced by the player's own walking
+     * rather than by the ride, and leaving it in meant every step changed where down was.</p>
+     */
+    private static void applyLean(final Vector3d up, final ForceState state) {
+        final double lean = CfConfig.CAMERA_LEAN.get();
+        final double cap = Math.toRadians(CfConfig.CAMERA_LEAN_MAX_DEG.get());
+
+        if (lean <= 0.0 || cap <= 0.0) {
+            return;
+        }
+
+        final Vector3d feltUp = new Vector3d(state.apparent).sub(state.coriolis).negate();
+
+        if (feltUp.lengthSquared() < 1.0e-9 || !feltUp.isFinite()) {
+            return;
+        }
+
+        feltUp.normalize();
+
+        final double dot = Math.min(1.0, Math.max(-1.0, up.dot(feltUp)));
+        final double angle = Math.acos(dot);
+
+        if (!(angle > 1.0e-4)) {
+            return;
+        }
+
+        final double wanted = Math.min(angle * lean, cap);
+
+        up.lerp(feltUp, Math.min(1.0, wanted / angle));
+
+        if (up.lengthSquared() < 1.0e-9 || !up.isFinite()) {
+            up.set(0.0, 1.0, 0.0);
+        } else {
+            up.normalize();
+        }
+    }
+
+    /**
      * Slop, not a threshold.
      *
-     * <p>Motion smaller than the dead band does not move the camera at all, which is what removes
-     * the micro-tremble. Past the dead band the target follows continuously, offset by the dead band
-     * - so there is no step, and therefore no stair-stepping, which is what a hard threshold would
+     * <p>Motion smaller than the dead band does not move the camera at all, which removes the
+     * micro-tremble. Past the dead band the target follows continuously, offset by the dead band -
+     * so there is no step, and therefore no stair-stepping, which is what a hard threshold would
      * have traded the tremble for.</p>
      */
     private void applyDeadBand() {
@@ -294,10 +327,10 @@ public final class CfTiltSource implements TiltSource {
     /**
      * How much of a loop we are in, 0..1, and maintains the running average of the target.
      *
-     * <p>The average's window is tied to the revolution period rather than fixed. That matters: a
-     * fixed window either fails to cover a slow loop, in which case the average still swings and
-     * the camera still rolls, or over-smooths a fast one, in which case the camera stops responding
-     * to anything. Half a revolution is enough for the swinging part to cancel.</p>
+     * <p>The average's window is tied to the revolution period rather than fixed. A fixed window
+     * either fails to cover a slow loop, in which case the average still swings and the camera
+     * still rolls, or over-smooths a fast one, in which case the camera stops responding to
+     * anything. Half a revolution is enough for the swinging part to cancel.</p>
      */
     private double updateLoop(final ForceState state, final Vector3d feltUp, final double dt) {
         // Horizontal component only. Rotation about a vertical axis is a turn, and a turn should
@@ -350,13 +383,12 @@ public final class CfTiltSource implements TiltSource {
      * Extra stiffness from a change of direction.
      *
      * <p>Primarily the rate at which the target is swinging, with a smaller contribution from the
-     * sub-level's angular acceleration so that a sharp flick of the controls registers even before
-     * the force has finished moving. Both are derivatives: they are large exactly when the ride
-     * changes what it is doing, and zero when it is doing the same thing quickly - which is what
-     * "sharp" means.</p>
+     * sub-level's angular acceleration so a sharp flick registers even before the force has
+     * finished moving. Both are derivatives: large exactly when the ride changes what it is doing,
+     * zero when it is doing the same thing quickly - which is what "sharp" means.</p>
      *
      * <p>The curve is {@code x / (1 + x)}: monotonic, bounded by 1 and therefore by
-     * {@code jolt_gain}, and with no knee to fall off. Predictable by construction rather than by
+     * {@code jolt_gain}, with no knee to fall off. Predictable by construction rather than by
      * tuning - twice the swing gives more response, always, and it cannot spike.</p>
      */
     private double joltBoost(final ForceState state) {
