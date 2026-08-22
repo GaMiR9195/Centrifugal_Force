@@ -77,10 +77,15 @@ public final class CfCommands {
                         CfConfig.AIR_STRENGTH, 0.0, 4.0))
                 .then(knob("grip", CfConfig.GRIP_ENABLED,
                         CfConfig.GRIP_STRENGTH, 0.0, 4.0))
+                .then(knob("slip", CfConfig.SLIP_ENABLED,
+                        CfConfig.SLIP_STRENGTH, 0.0, 2.0))
                 .then(knob("camera", CfConfig.CAMERA_ENABLED,
                         CfConfig.CAMERA_AMOUNT, 0.0, 2.0))
                 .then(knob("hitbox", CfConfig.HITBOX_ENABLED,
                         CfConfig.HITBOX_AMOUNT, 0.0, 1.0))
+                // No strength: it either fires on a hard stall or it does not. A number here would
+                // only invite tuning something that should be a rare, decisive event.
+                .then(toggle("release", CfConfig.RELEASE_ENABLED))
                 .then(Commands.literal("reset")
                         .requires(source -> source.hasPermission(2))
                         .executes(CfCommands::reset));
@@ -128,6 +133,30 @@ public final class CfCommands {
                         }));
     }
 
+    /** {@code <name> enable|disable} for a subsystem with nothing to scale. */
+    private static LiteralArgumentBuilder<CommandSourceStack> toggle(
+            final String name, final ModConfigSpec.BooleanValue enabled) {
+
+        return Commands.literal(name)
+                .requires(source -> source.hasPermission(2))
+                .executes(context -> {
+                    reply(context, label(name).append(onOff(enabled.get())));
+                    return 1;
+                })
+                .then(Commands.literal("enable").executes(context -> {
+                    enabled.set(true);
+                    enabled.save();
+                    reply(context, label(name).append(onOff(true)));
+                    return 1;
+                }))
+                .then(Commands.literal("disable").executes(context -> {
+                    enabled.set(false);
+                    enabled.save();
+                    reply(context, label(name).append(onOff(false)));
+                    return 1;
+                }));
+    }
+
     private static int toggleOverlay(
             final CommandContext<CommandSourceStack> context, final Boolean explicit) {
 
@@ -141,31 +170,67 @@ public final class CfCommands {
         return 1;
     }
 
+    /**
+     * Restores every value the commands can touch.
+     *
+     * <p>Reads each default from the config spec rather than from a list written out here. The list
+     * that used to live in this method had already drifted - it was resetting the camera response to
+     * 9.0 after the default became 4.5, so "reset" quietly moved you further from the tuned
+     * behaviour than where you started. A default belongs in exactly one place.</p>
+     */
     private static int reset(final CommandContext<CommandSourceStack> context) {
-        set(CfConfig.CENTRIFUGAL_ENABLED, true);
-        set(CfConfig.CENTRIFUGAL_STRENGTH, 1.0);
-        set(CfConfig.CORIOLIS_STRENGTH, 0.35);
-        set(CfConfig.AIR_ENABLED, true);
-        set(CfConfig.AIR_STRENGTH, 1.0);
-        set(CfConfig.GRIP_ENABLED, true);
-        set(CfConfig.GRIP_STRENGTH, 0.85);
-        set(CfConfig.HITBOX_ENABLED, true);
-        set(CfConfig.HITBOX_AMOUNT, 1.0);
-        set(CfConfig.CAMERA_ENABLED, true);
-        set(CfConfig.CAMERA_AMOUNT, 1.0);
-        set(CfConfig.CAMERA_RESPONSE, 9.0);
-        set(CfConfig.CAMERA_DAMPING, 1.0);
-        set(CfConfig.CAMERA_JOLT_GAIN, 1.6);
-        set(CfConfig.CAMERA_LOOP_SUPPRESSION, 0.85);
-        set(CfConfig.CAMERA_WALK_DAMPING, 0.65);
+        restore(CfConfig.CENTRIFUGAL_ENABLED);
+        restore(CfConfig.CENTRIFUGAL_STRENGTH);
+        restore(CfConfig.CORIOLIS_STRENGTH);
+        restore(CfConfig.MAX_ACCEL_G);
+
+        restore(CfConfig.AIR_ENABLED);
+        restore(CfConfig.AIR_STRENGTH);
+
+        restore(CfConfig.GRIP_ENABLED);
+        restore(CfConfig.GRIP_STRENGTH);
+        restore(CfConfig.GRIP_BRACE_BONUS);
+        restore(CfConfig.GRIP_MIN_PRESS_G);
+        restore(CfConfig.GRIP_FULL_PRESS_G);
+        restore(CfConfig.ATTACH_PRESS_G);
+        restore(CfConfig.ATTACH_RELEASE_G);
+        restore(CfConfig.ATTACH_SHARE);
+        restore(CfConfig.ATTACH_ADHESION_G);
+
+        restore(CfConfig.SLIP_ENABLED);
+        restore(CfConfig.SLIP_STRENGTH);
+        restore(CfConfig.SLIP_MAX_SPEED);
+        restore(CfConfig.RIM_CLIMB_G);
+        restore(CfConfig.RIM_CLIMB_SPEED);
+
+        restore(CfConfig.RELEASE_ENABLED);
+        restore(CfConfig.RELEASE_DECEL_G);
+        restore(CfConfig.RELEASE_MIN_SPEED);
+
+        restore(CfConfig.HITBOX_ENABLED);
+        restore(CfConfig.HITBOX_AMOUNT);
+
+        restore(CfConfig.CAMERA_ENABLED);
+        restore(CfConfig.CAMERA_AMOUNT);
+        restore(CfConfig.CAMERA_RESPONSE);
+        restore(CfConfig.CAMERA_DAMPING);
+        restore(CfConfig.CAMERA_SMOOTHING);
+        restore(CfConfig.CAMERA_DEADBAND_DEG);
+        restore(CfConfig.CAMERA_JOLT_GAIN);
+        restore(CfConfig.CAMERA_LOOP_SUPPRESSION);
+        restore(CfConfig.CAMERA_WALK_DAMPING);
+        restore(CfConfig.CAMERA_PITCH_RESPONSE);
+        restore(CfConfig.CAMERA_DECK_LEAN);
+        restore(CfConfig.CAMERA_MAX_TILT_DEG);
+        restore(CfConfig.CAMERA_SLEW_DEG_PER_S);
 
         reply(context, Component.literal("Reset to defaults.").withStyle(OK));
 
         return 1;
     }
 
-    private static <T> void set(final ModConfigSpec.ConfigValue<T> value, final T fresh) {
-        value.set(fresh);
+    private static <T> void restore(final ModConfigSpec.ConfigValue<T> value) {
+        value.set(value.getDefault());
         value.save();
     }
 
@@ -185,11 +250,13 @@ public final class CfCommands {
         reply(context, join(
                 describe("centrifugal", CfConfig.CENTRIFUGAL_ENABLED, CfConfig.CENTRIFUGAL_STRENGTH),
                 describe("air", CfConfig.AIR_ENABLED, CfConfig.AIR_STRENGTH),
-                describe("grip", CfConfig.GRIP_ENABLED, CfConfig.GRIP_STRENGTH)));
+                describe("grip", CfConfig.GRIP_ENABLED, CfConfig.GRIP_STRENGTH),
+                describe("slip", CfConfig.SLIP_ENABLED, CfConfig.SLIP_STRENGTH)));
 
         reply(context, join(
                 describe("camera", CfConfig.CAMERA_ENABLED, CfConfig.CAMERA_AMOUNT),
                 describe("hitbox", CfConfig.HITBOX_ENABLED, CfConfig.HITBOX_AMOUNT),
+                label("release").append(onOff(CfConfig.RELEASE_ENABLED.get())),
                 label("overlay").append(onOff(CfConfig.DEBUG_OVERLAY.get()))));
 
         if (!state.active) {
@@ -204,9 +271,22 @@ public final class CfCommands {
 
         reply(context, join(
                 label("press").append(number(pressG, pressColour(pressG))).append(unit(" g")),
-                label("load").append(number(state.tangentialLoad,
-                        state.tangentialLoad <= state.hold ? OK : DANGER)),
-                label("hold").append(number(state.hold, ChatFormatting.WHITE))));
+                label("load").append(number(state.tangentialLoad / CfConfig.GRAVITY,
+                        state.tangentialLoad <= state.hold ? OK : DANGER)).append(unit(" g")),
+                label("hold").append(number(state.hold / CfConfig.GRAVITY, ChatFormatting.WHITE))
+                        .append(unit(" g"))));
+
+        // The first line to read when something feels wrong. Near zero means the mod believes no
+        // ride is acting on you, so nothing it does should be visible - if you are being moved
+        // anyway, it is not this mod.
+        reply(context, join(
+                label("ride share").append(number(state.frameShare,
+                        state.frameShare > 0.5 ? WARN : ChatFormatting.WHITE)),
+                label("contacts").append(count(state.contactCount,
+                        state.contactCount > 0 ? ChatFormatting.WHITE : OFF)),
+                label("attached").append(state.attached
+                        ? Component.literal("wall").withStyle(ChatFormatting.LIGHT_PURPLE)
+                        : Component.literal("no").withStyle(OFF))));
 
         final MutableComponent footing = state.gripped
                 ? (state.slipping
@@ -229,9 +309,20 @@ public final class CfCommands {
         reply(context, join(
                 label("spin").append(number(spin, spin > 2.5 ? WARN : ChatFormatting.WHITE))
                         .append(unit(" rad/s")),
+                label("gate").append(number(state.spinGate,
+                        state.spinGate > 0.0 ? ChatFormatting.WHITE : OFF)),
                 label("jolt").append(number(jolt, jolt > 6.0 ? WARN : ChatFormatting.WHITE))
-                        .append(unit(" rad/s2")),
+                        .append(unit(" rad/s2"))));
+
+        // Air speed is deliberately deck-relative. On a platform simply travelling at 25 m/s this
+        // reads near zero, and that is the fix for being swept off one - if it reads high while you
+        // are standing still, the deck is spinning, not merely moving.
+        reply(context, join(
                 label("air").append(number(state.airVelocity.length(), ChatFormatting.WHITE))
+                        .append(unit(" m/s")),
+                label("deck").append(number(state.deckVelocity.length(), ChatFormatting.WHITE))
+                        .append(unit(" m/s")),
+                label("carried").append(number(state.deckTranslation.length(), OFF))
                         .append(unit(" m/s"))));
 
         return 1;
@@ -278,6 +369,10 @@ public final class CfCommands {
 
     private static MutableComponent number(final double value, final ChatFormatting colour) {
         return Component.literal(String.format(Locale.ROOT, "%.2f", value)).withStyle(colour);
+    }
+
+    private static MutableComponent count(final int value, final ChatFormatting colour) {
+        return Component.literal(Integer.toString(value)).withStyle(colour);
     }
 
     private static MutableComponent unit(final String text) {

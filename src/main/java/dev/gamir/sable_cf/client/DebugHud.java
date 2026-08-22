@@ -11,10 +11,17 @@ import net.neoforged.neoforge.client.event.RenderGuiEvent;
 /**
  * The numbers behind the arrows.
  *
- * <p>Arrows show you the shape of what is happening; only numbers tell you <i>why</i> you slid. The
- * line that matters is press vs hold vs load: friction can hold {@code hold} and something is
- * pushing with {@code load}, so the moment load passes hold you start moving, and you can watch it
- * happen instead of guessing.</p>
+ * <p>Arrows show you the shape of what is happening; only numbers tell you <i>why</i> you slid. Two
+ * lines carry most of the value:</p>
+ *
+ * <ul>
+ *   <li><b>press / hold / load.</b> Friction can hold {@code hold} and something is pushing with
+ *       {@code load}, so the moment load passes hold you start moving - and you can watch it happen
+ *       instead of guessing.</li>
+ *   <li><b>share.</b> How much of the press the ride is supplying rather than gravity. This is the
+ *       first thing to read when the mod seems to be doing something it should not: near zero means
+ *       it believes nothing is acting on you, so anything moving you is not this mod.</li>
+ * </ul>
  *
  * <p>Colours follow the same convention as {@code /sable_cf status}, so the same reading means the
  * same thing whichever surface you read it from.</p>
@@ -29,6 +36,7 @@ public final class DebugHud {
     private static final int AMBER = 0xFFFFC050;
     private static final int RED = 0xFFFF6060;
     private static final int GREY = 0xFFA0A0A0;
+    private static final int VIOLET = 0xFFD08CFF;
 
     @SubscribeEvent
     public void onRenderGui(final RenderGuiEvent.Post event) {
@@ -56,8 +64,9 @@ public final class DebugHud {
         final double spin = state.omega.length();
 
         graphics.drawString(minecraft.font, String.format(
-                        "sable_cf spin %.2f rad/s (%.0f rpm) jolt %.1f rad/s2",
-                        spin, spin * 60.0 / (2.0 * Math.PI), state.angularAcceleration.length()),
+                        "sable_cf spin %.2f rad/s (%.0f rpm) gate %.2f jolt %.1f rad/s2",
+                        spin, spin * 60.0 / (2.0 * Math.PI), state.spinGate,
+                        state.angularAcceleration.length()),
                 MARGIN, y, WHITE);
         y += LINE_HEIGHT;
 
@@ -67,12 +76,24 @@ public final class DebugHud {
                 MARGIN, y, state.tangentialLoad > state.hold ? AMBER : GREEN);
         y += LINE_HEIGHT;
 
-        // Deck velocity is the omega x r term. It is on screen because it is the number that
-        // explains being thrown off a spinner: it can be large while your own movement is zero.
+        // Share and contacts together answer "should this mod be doing anything at all right now".
+        // Both near zero on an ordinary moving deck, by construction rather than by tuning.
         graphics.drawString(minecraft.font, String.format(
-                        "air %.1f m/s deck %.1f m/s own %.1f m/s drag %.2fg",
+                        "share %.2f contacts %d %s",
+                        state.frameShare,
+                        state.contactCount,
+                        state.attached ? "ATTACHED" : "free"),
+                MARGIN, y, state.attached ? VIOLET : GREY);
+        y += LINE_HEIGHT;
+
+        // Air speed is deck-relative: the sub-level's rigid translation is subtracted, so a
+        // platform merely travelling reads near zero here however fast it is going. "carried" is
+        // what was taken out, shown so the subtraction is visible rather than a claim.
+        graphics.drawString(minecraft.font, String.format(
+                        "air %.1f deck %.1f carried %.1f own %.1f m/s drag %.2fg",
                         state.airVelocity.length(),
                         state.deckVelocity.length(),
+                        state.deckTranslation.length(),
                         state.relativeVelocity.length(),
                         state.drag.length() / gravity),
                 MARGIN, y, WHITE);
@@ -109,5 +130,13 @@ public final class DebugHud {
                         state.coriolis.length() / gravity,
                         state.applied.length() / gravity),
                 MARGIN, y, GREY);
+        y += LINE_HEIGHT;
+
+        graphics.drawString(minecraft.font, String.format(
+                        "outward %.2fg climb %.2fg%s",
+                        state.outwardSlip.length() / gravity,
+                        state.climbAssist.length() / gravity,
+                        state.released ? "  RELEASED" : ""),
+                MARGIN, y, state.released ? VIOLET : GREY);
     }
 }

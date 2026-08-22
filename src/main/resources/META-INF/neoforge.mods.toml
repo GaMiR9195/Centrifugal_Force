@@ -5,18 +5,25 @@ issueTrackerURL = "https://github.com/GaMiR9195/Centrifugal_Force/issues"
 
 [[mods]]
 modId = "sable_cf"
-version = "0.2.0"
+# Expanded by processResources from gradle.properties, so the version lives in exactly one
+# place. Bumping it in two files by hand is how a jar ends up lying about what it is.
+version = "${mod_version}"
 displayName = "Sable Centrifugal Force"
 authors = "GaMiR9195"
+# Must be a PNG (or another format Minecraft's texture loader accepts). WebP is not supported
+# anywhere in the game's asset pipeline. Place the file at src/main/resources/icon.png - the
+# path is relative to the resources root, not to META-INF.
+logoFile = "icon.png"
 description = '''
-Rotating-frame physics for Sable sub-levels: centrifugal and Euler forces, air drag,
-foot friction, a collision box that rotates with the body, and a camera that leans the
-way a person would rather than locking to the deck plane.
+Rotating-frame physics for Sable sub-levels: centrifugal and Euler forces, deck-relative air
+drag, foot friction with deliberate outward slip, a collision box that rotates with the body,
+wall riding inside a spinning drum, and a camera that leans the way a person would rather than
+locking to the deck plane.
 '''
 
-# One mixin config, two mixins. See sable_cf.mixins.json - EntityMixin is the only
-# touch on vanilla, and EntitySubLevelUtilMixin fills in a Sable hook that currently
-# returns null. No refmap: NeoForge ships official mappings at runtime.
+# One mixin config, two mixins. See sable_cf.mixins.json - EntityMixin only adds a field to
+# Entity, and EntitySubLevelUtilMixin fills in a Sable hook that currently returns null.
+# No refmap: NeoForge ships official mappings at runtime.
 [[mixins]]
 config = "sable_cf.mixins.json"
 
@@ -45,7 +52,7 @@ ordering = "AFTER"
 side = "BOTH"
 
 # Optional, and client-only: without it everything except the camera tilt still works.
-# Needs a build with AeroCamSyncApi#addTiltSource, which as of 1.3.7 means the api-beta
+# Needs a build with AcsHandle#addTiltSource, which as of 1.3.7 means the api-beta
 # branch. The bridge degrades to a no-op rather than crashing if it is missing.
 [[dependencies.sable_cf]]
 modId = "aero_cam_sync"
