@@ -1,190 +1,163 @@
 package com.playsi.centrifugal_force.internal;
 
 import dev.ryanhcode.sable.sublevel.SubLevel;
+import net.minecraft.world.phys.Vec3;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Quaterniond;
 import org.joml.Quaterniondc;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
-/**
- * Per-player adhesion state. One instance is created lazily the first time a player touches a
- * sub-level and reused afterwards.
- */
+/** Adhesion state of a single entity. */
 public final class AdhesionState {
-    private boolean active;
+    /** Orientation of the box inside the sub-level. */
+    private final Quaterniond local = new Quaterniond();
+    /** World orientation the running physics tick was set up with. */
+    private final Quaterniond current = new Quaterniond();
+    /** World orientation of the previous tick, for render and camera interpolation. */
+    private final Quaterniond previous = new Quaterniond();
+    private final Vector3d support = new Vector3d();
     private @Nullable SubLevel subLevel;
-    private boolean physicsPhase;
+    private @Nullable Transition transition;
+    private @Nullable Vec3 frameCarry;
+    private double supportPlane;
+    private boolean active;
+    private boolean grounded;
+    private boolean physicsTick;
 
-    private final Vector3d localUpPrevious = new Vector3d(AdhesionMath.UP);
-    private final Vector3d localUpCurrent = new Vector3d(AdhesionMath.UP);
-
-    private @Nullable PlaneTransition transition;
-    private int supportMissTicks;
-    private int reattachCooldownTicks;
-    private double supportDistance = Double.NaN;
+    /**
+     * The orientation Sable applies to the hitbox, to input and to the camera. It is pinned for the
+     * whole physics tick: an orientation that moves between collision substeps rotates the box
+     * around the eye mid-move, and Sable reads that displacement back as inherited velocity.
+     */
+    public @Nullable Quaterniondc orientation(final float partialTicks) {
+        if (!this.active) return null;
+        if (this.physicsTick) return this.current;
+        return this.previous.slerp(this.current, Math.max(0.0f, Math.min(1.0f, partialTicks)), new Quaterniond());
+    }
 
     public boolean isActive() {
-        return this.active && this.subLevel != null && !this.subLevel.isRemoved();
+        return this.active;
     }
 
-    public @Nullable SubLevel subLevel() {
-        return this.isActive() ? this.subLevel : null;
-    }
-
-    public Vector3dc currentLocalUp() {
-        return this.localUpCurrent;
+    public @Nullable Vec3 frameCarry() {
+        return this.frameCarry;
     }
 
     public String planeLabel() {
-        return AdhesionMath.axisLabel(this.localUpCurrent);
+        return Rotations.label(this.support);
+    }
+
+    public double tiltDegrees() {
+        final Vector3d up = this.current.transform(new Vector3d(Rotations.UP));
+        return Math.toDegrees(Math.acos(Math.max(-1.0, Math.min(1.0, up.y))));
     }
 
     public boolean isChangingPlane() {
-        return this.transition != null && this.transition.drivesPosition();
+        return this.transition != null;
     }
 
     public double transitionProgress() {
         return this.transition == null ? 1.0 : this.transition.progress();
     }
 
-    public double supportDistance() {
-        return this.supportDistance;
+    public boolean isGrounded() {
+        return this.grounded;
     }
 
-    public void setSupportDistance(final double distance) {
-        this.supportDistance = distance;
+    @Nullable SubLevel subLevel() {
+        return this.subLevel;
     }
 
-    public int supportMissTicks() {
-        return this.supportMissTicks;
+    Quaterniondc localOrientation() {
+        return this.local;
     }
 
-    public void resetSupportMisses() {
-        this.supportMissTicks = 0;
+    Quaterniondc currentOrientation() {
+        return this.current;
     }
 
-    public int missSupport() {
-        return ++this.supportMissTicks;
+    Vector3dc support() {
+        return this.support;
     }
 
-    public void tickReattachCooldown() {
-        if (!this.active && this.reattachCooldownTicks > 0) this.reattachCooldownTicks--;
+    double supportPlane() {
+        return this.supportPlane;
     }
 
-    public boolean canAttach() {
-        return !this.active && this.reattachCooldownTicks == 0;
+    void setSupportPlane(final double plane) {
+        this.supportPlane = plane;
     }
 
-    /**
-     * Freezes the local plane for the whole physics tick.
-     *
-     * <p>Sable derives the motion a sub-level hands to its riders from how far the feet anchor
-     * moved inside a single collide() pass, then applies that motion with a main-level-only
-     * collide. A local plane rotation sampled per substep therefore shows up as a large inherited
-     * velocity that is not checked against sub-level blocks at all: the player is pushed straight
-     * through the wall in the direction the feet swung, and the value is fed back as velocity so
-     * it keeps accelerating. Holding the local part still for the tick makes that term exactly
-     * zero, while the frame part stays live so real deck rotation is still inherited.
-     */
-    public void beginPhysicsTick() {
-        this.localUpPrevious.set(this.localUpCurrent);
-        this.physicsPhase = true;
+    void setGrounded(final boolean grounded) {
+        this.grounded = grounded;
     }
 
-    public void endPhysicsTick() {
-        this.physicsPhase = false;
+    void setFrameCarry(final @Nullable Vec3 carry) {
+        this.frameCarry = carry;
     }
 
-    public void attach(final SubLevel newSubLevel, final Vector3dc supportLocalUp, final Vector3dc localWorldUp) {
-        this.subLevel = newSubLevel;
+    boolean isChanging() {
+        return this.transition != null;
+    }
+
+    void attach(final SubLevel subLevel, final Vector3dc support, final double plane, final Quaterniondc local) {
+        this.subLevel = subLevel;
+        this.support.set(support);
+        this.supportPlane = plane;
+        this.local.set(local);
+        this.current.identity();
+        this.previous.identity();
+        this.transition = null;
+        this.frameCarry = null;
         this.active = true;
-        this.supportMissTicks = 0;
-        this.reattachCooldownTicks = 0;
-        this.supportDistance = Double.NaN;
-
-        // Start from the local direction that already maps onto world up, so the very first
-        // orientation is identity and attaching cannot move the view at all.
-        this.localUpCurrent.set(localWorldUp).normalize();
-        this.localUpPrevious.set(this.localUpCurrent);
-
-        final Vector3d target = new Vector3d(supportLocalUp).normalize();
-        if (this.localUpCurrent.dot(target) > 0.9995) {
-            this.localUpCurrent.set(target);
-            this.transition = null;
-        } else {
-            this.transition = PlaneTransition.alignment(this.localUpCurrent, target,
-                    AdhesionSettings.ATTACH_ALIGN_TICKS);
-        }
     }
 
-    public void detach() {
+    void begin(final Transition transition) {
+        this.transition = transition;
+    }
+
+    Transition.Contact[] contacts(final boolean grounded) {
+        if (this.transition != null) return this.transition.contacts();
+        if (!grounded) return Transition.NONE;
+        return new Transition.Contact[]{new Transition.Contact(new Vector3d(this.support), this.supportPlane)};
+    }
+
+    /** @return true when the transition that just finished ends adhesion */
+    boolean advance() {
+        final Transition transition = this.transition;
+        if (transition == null) return false;
+
+        transition.advance();
+        transition.orientationAt(transition.progress(), this.local);
+        if (!transition.finished()) return false;
+
+        this.transition = null;
+        final Transition.Contact result = transition.result();
+        if (result == null) return true;
+        this.support.set(result.normal());
+        this.supportPlane = result.plane();
+        return false;
+    }
+
+    void commit(final Quaterniondc orientation) {
+        this.previous.set(this.current);
+        this.current.set(orientation);
+    }
+
+    void clear() {
         this.active = false;
+        this.grounded = false;
         this.subLevel = null;
         this.transition = null;
-        this.supportMissTicks = 0;
-        this.supportDistance = Double.NaN;
-        this.reattachCooldownTicks = AdhesionSettings.REATTACH_COOLDOWN_TICKS;
-        this.localUpPrevious.set(AdhesionMath.UP);
-        this.localUpCurrent.set(AdhesionMath.UP);
+        this.frameCarry = null;
     }
 
-    public boolean beginPlaneChange(final Vector3dc targetLocalUp, final double fromPlane, final double toPlane,
-                                   final double eyeHeight, final double halfWidth) {
-        if (!this.isActive() || this.transition != null) return false;
-        final PlaneTransition next = PlaneTransition.corner(this.localUpCurrent, targetLocalUp, fromPlane, toPlane,
-                eyeHeight, halfWidth, AdhesionSettings.CORNER_TICKS);
-        if (next == null) return false;
-        this.transition = next;
-        return true;
+    void beginPhysicsTick() {
+        this.physicsTick = true;
     }
 
-    public void advanceTransition() {
-        if (this.transition == null) return;
-        this.transition.advance();
-        this.transition.upAt(this.transition.easedProgress(), this.localUpCurrent);
-    }
-
-    public @Nullable Vector3d transitionPivotTarget(final Vector3dc currentPivotLocal, final Vector3d dest) {
-        if (this.transition == null || !this.transition.drivesPosition()) return null;
-        return this.transition.pivotAt(this.transition.easedProgress(), currentPivotLocal, dest);
-    }
-
-    public boolean finishTransitionIfComplete() {
-        if (this.transition == null || !this.transition.finished()) return false;
-        this.transition.upAt(1.0, this.localUpCurrent);
-        AdhesionMath.snapAxis(this.localUpCurrent, this.localUpCurrent);
-        this.transition = null;
-        return true;
-    }
-
-    public @Nullable Quaterniondc orientationAt(final float partialTick) {
-        if (!this.isActive()) return null;
-        final SubLevel sub = this.subLevel;
-        if (sub == null) return null;
-        final double t = Math.max(0.0, Math.min(1.0, partialTick));
-
-        final Vector3d localUp = new Vector3d();
-        if (this.physicsPhase || !sub.getLevel().isClientSide()) {
-            localUp.set(this.localUpCurrent);
-        } else {
-            localUp.set(this.localUpPrevious).lerp(this.localUpCurrent, t);
-            if (localUp.lengthSquared() < 1.0e-9) localUp.set(this.localUpCurrent);
-            else localUp.normalize();
-        }
-
-        // The frame is read straight from the sub-level's own poses every single time and never
-        // integrated or smoothed, so the player cannot fall behind the sub-level's rotation.
-        final Quaterniond frame = new Quaterniond(sub.lastPose().orientation())
-                .slerp(sub.logicalPose().orientation(), t);
-        final Vector3d worldUp = frame.transform(localUp, new Vector3d()).normalize();
-        final Vector3d fallbackAxis = frame.transform(new Vector3d(1.0, 0.0, 0.0));
-        return AdhesionMath.swingFromUp(worldUp, fallbackAxis, new Quaterniond());
-    }
-
-    public double tiltDegrees() {
-        final Quaterniondc orientation = this.orientationAt(1.0f);
-        if (orientation == null) return 0.0;
-        return Math.toDegrees(2.0 * Math.acos(Math.min(1.0, Math.abs(orientation.w()))));
+    void endPhysicsTick() {
+        this.physicsTick = false;
     }
 }

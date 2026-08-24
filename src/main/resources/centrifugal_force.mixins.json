@@ -5,9 +5,12 @@
   "compatibilityLevel": "JAVA_21",
   "mixins": [
     "EntityAdhesionStateMixin",
+    "EntityFrameCarryMixin",
     "EntitySubLevelUtilMixin"
   ],
-  "client": [],
+  "client": [
+    "DebugScreenOverlayMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   }

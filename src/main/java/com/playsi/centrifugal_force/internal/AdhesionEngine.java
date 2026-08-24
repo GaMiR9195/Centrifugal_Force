@@ -1,314 +1,239 @@
 package com.playsi.centrifugal_force.internal;
 
 import dev.ryanhcode.sable.Sable;
-import dev.ryanhcode.sable.companion.math.BoundingBox3d;
 import dev.ryanhcode.sable.companion.math.Pose3dc;
 import dev.ryanhcode.sable.mixinterface.entity.entity_sublevel_collision.EntityMovementExtension;
-import dev.ryanhcode.sable.mixinterface.entity.entity_sublevel_collision.LivingEntityMovementExtension;
 import dev.ryanhcode.sable.sublevel.SubLevel;
 import dev.ryanhcode.sable.sublevel.entity_collision.SubLevelEntityCollision;
+import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.entity.ai.attributes.Attributes;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.event.tick.EntityTickEvent;
 import org.jetbrains.annotations.Nullable;
+import org.joml.Quaterniond;
 import org.joml.Quaterniondc;
 import org.joml.Vector3d;
 import org.joml.Vector3dc;
 
 /**
- * Drives adhesion for every player. Each step is a separate static method so it can be reused or
- * replaced from other code without touching the tick wiring.
+ * Drives adhesion for the local player.
+ *
+ * <p>Every decision is taken in the pre-tick, before movement runs: the orientation for the tick is
+ * committed, the box centre is placed so the box stays tangent to the planes it rests on, and the
+ * frame carry Sable applies later in the tick is reduced to pure sub-level motion. Nothing rotates
+ * or teleports while collisions are being resolved.
  */
 public final class AdhesionEngine {
     public static final AdhesionEngine INSTANCE = new AdhesionEngine();
 
+    private static final int ALIGN_TICKS = 4;
+    private static final int ROLL_TICKS = 10;
+    private static final int RELEASE_TICKS = 4;
+
+    /** How close a plane has to be for the box to count as resting on it. */
+    private static final double CONTACT_GAP = 0.12;
+    /** Adhesion has to survive a jump, so support is looked for well past the box. */
+    private static final double SUPPORT_REACH = 1.4;
+    private static final double ATTACH_REACH = 0.4;
+    private static final double MIN_PRESS = 1.0e-3;
+    private static final double MIN_UPWARD = 0.05;
+    /** Vertical drag LivingEntity#travel applies right after gravity. */
+    private static final double VERTICAL_DRAG = 0.98;
+    private static final double[] ARC_SAMPLES = {0.35, 0.7, 1.0};
+    private static final double ARC_SKIN = 0.02;
+
+    private static final Quaterniondc IDENTITY = new Quaterniond();
+
     private AdhesionEngine() {}
 
     @SubscribeEvent
-    public void onEntityTickPre(final EntityTickEvent.Pre event) {
-        if (!(event.getEntity() instanceof final Player player)) return;
+    public void onPreTick(final EntityTickEvent.Pre event) {
+        if (!(event.getEntity() instanceof final Player player) || !player.isLocalPlayer()) return;
 
-        AdhesionState state = peekState(player);
-        if (state != null) {
-            state.endPhysicsTick();
-            state.tickReattachCooldown();
-        }
-
-        if (!eligible(player)) {
-            if (state != null && state.isActive()) state.detach();
-            return;
-        }
-
-        if (state == null || !state.isActive()) {
-            final SubLevel candidate = findCandidate(player);
-            if (candidate == null) return;
-            if (state == null) state = createState(player);
-            if (!state.canAttach() || !tryAttach(player, state, candidate)) return;
-        }
-
-        final SubLevel subLevel = state.subLevel();
-        if (subLevel == null || subLevel.getLevel() != player.level()) {
-            state.detach();
-            return;
-        }
-
-        // Keep Sable's own tracking pointed at this sub-level so deck carrying and Sure Footing
-        // keep working while standing on a wall.
-        ((EntityMovementExtension) player).sable$setTrackingSubLevel(subLevel);
-
-        // Must happen before anything in this tick can collide.
+        final AdhesionState state = ((AdhesionAccess) player).centrifugalForce$getOrCreateAdhesionState();
+        update(player, state);
         state.beginPhysicsTick();
-        state.advanceTransition();
-
-        if (state.isChangingPlane() && ownsMovement(player)) {
-            // While rounding a corner the arc is the only thing allowed to move the player, so
-            // nothing can push the hitbox into the geometry or fling it away.
-            applyCornerPosition(player, state, subLevel);
-            player.setDeltaMovement(Vec3.ZERO);
-            clearInheritedVelocity(player);
-            player.resetFallDistance();
-        }
     }
 
     @SubscribeEvent
-    public void onEntityTickPost(final EntityTickEvent.Post event) {
-        if (!(event.getEntity() instanceof final Player player)) return;
+    public void onPostTick(final EntityTickEvent.Post event) {
+        if (!(event.getEntity() instanceof final Player player) || !player.isLocalPlayer()) return;
 
-        final AdhesionState state = peekState(player);
+        final AdhesionState state = ((AdhesionAccess) player).centrifugalForce$peekAdhesionState();
         if (state == null) return;
         state.endPhysicsTick();
-        if (!state.isActive()) return;
+        if (state.isActive()) redirectGravity(player, state);
+    }
+
+    private void update(final Player player, final AdhesionState state) {
+        if (!state.isActive() && !attach(player, state)) return;
 
         final SubLevel subLevel = state.subLevel();
-        if (subLevel == null || !eligible(player) || subLevel.getLevel() != player.level()) {
-            state.detach();
+        if (subLevel == null || subLevel.isRemoved() || subLevel.getLevel() != player.level()
+                || player.isSpectator() || player.isPassenger()) {
+            state.clear();
             return;
         }
 
-        final EntityMovementExtension movement = (EntityMovementExtension) player;
-
-        if (state.isChangingPlane()) {
-            // Any leftover inherited velocity here can only have come from the orientation step
-            // itself, so it is dropped instead of being allowed to build up.
-            clearInheritedVelocity(player);
-            player.resetFallDistance();
-            state.finishTransitionIfComplete();
-            movement.sable$setTrackingSubLevel(subLevel);
-            return;
-        }
-        state.finishTransitionIfComplete();
-
-        if (ownsMovement(player)) {
-            tryPlaneChange(player, state, subLevel, movement.sable$getCollisionInfo());
-            applyLocalGravity(player, state);
-        }
-
-        updateSupport(player, state, subLevel, movement.sable$getCollisionInfo());
-        if (state.isActive()) movement.sable$setTrackingSubLevel(subLevel);
-    }
-
-    /** Finds a sub-level worth testing, without requiring the player to already stand on one. */
-    public static @Nullable SubLevel findCandidate(final Player player) {
-        final SubLevel tracked = Sable.HELPER.getTrackingSubLevel(player);
-        if (tracked != null && !tracked.isRemoved()) return tracked;
-
-        final SubLevel containing = Sable.HELPER.getContaining(player);
-        if (containing != null && !containing.isRemoved()) return containing;
-
-        // A slope steep enough to slide off never becomes a tracked floor, so the search cannot
-        // depend on tracking at all.
-        final BoundingBox3d bounds = new BoundingBox3d(player.getBoundingBox().inflate(1.0));
-        for (final SubLevel subLevel : Sable.HELPER.getAllIntersecting(player.level(), bounds)) {
-            if (!subLevel.isRemoved()) return subLevel;
-        }
-        return null;
-    }
-
-    /**
-     * Attaches to whichever of the six local faces is under the player's pivot.
-     *
-     * <p>The probe runs in the sub-level's own space, so how steep the surface is in world terms
-     * is irrelevant: a deck tilted past the point where vanilla would let anyone stand still has
-     * a local face right under the pivot, and that is what gets picked.
-     */
-    public static boolean tryAttach(final Player player, final AdhesionState state, final SubLevel subLevel) {
         final Pose3dc pose = subLevel.logicalPose();
-        final Vector3d pivotLocal = SurfaceProbe.localPivot(player, pose, new Vector3d());
-        final Vector3d localWorldUp = pose.transformNormalInverse(new Vector3d(AdhesionMath.UP), new Vector3d());
-        if (localWorldUp.lengthSquared() < 1.0e-9) return false;
-        localWorldUp.normalize();
+        final Hitbox hitbox = new Hitbox(player).orient(state.localOrientation());
+        final Vector3d centre = hitbox.localCentre(player.position(), state.currentOrientation(), pose, new Vector3d());
 
-        final double eyeHeight = player.getEyeHeight();
-        Vector3dc best = null;
-        double bestScore = -Double.MAX_VALUE;
+        final boolean grounded = updateSupport(player, state, subLevel, hitbox, centre);
+        state.setGrounded(grounded);
+        if (grounded && !state.isChanging()) tryRoll(player, state, subLevel, pose, hitbox, centre);
 
-        for (final Vector3dc axis : AdhesionMath.AXES) {
-            final SurfaceProbe.Hit hit = SurfaceProbe.probe(player, subLevel, pivotLocal, axis,
-                    eyeHeight + AdhesionSettings.ATTACH_REACH);
-            if (hit == null) continue;
-            final double gap = hit.distance() - eyeHeight;
-            if (gap < -AdhesionSettings.ATTACH_SINK_TOLERANCE || gap > AdhesionSettings.ATTACH_REACH) continue;
-            final double score = axis.dot(localWorldUp) * 0.35 - Math.abs(gap);
-            if (score > bestScore) {
-                bestScore = score;
-                best = axis;
-            }
+        final Transition.Contact[] contacts = state.contacts(grounded);
+        final boolean ended = state.advance();
+
+        hitbox.orient(state.localOrientation());
+        for (final Transition.Contact contact : contacts) {
+            hitbox.rest(centre, contact.normal(), contact.plane());
         }
 
-        if (best == null) return false;
-        state.attach(subLevel, best, localWorldUp);
+        final Quaterniond orientation = new Quaterniond(pose.orientation()).mul(state.localOrientation());
+        final Vec3 position = hitbox.position(centre, orientation, pose);
+        player.setPos(position.x, position.y, position.z);
+
+        state.commit(orientation);
+        state.setFrameCarry(frameCarry(subLevel, hitbox.feet(position, orientation)));
+        ((EntityMovementExtension) player).sable$setTrackingSubLevel(subLevel);
+        if (ended) state.clear();
+    }
+
+    /** Starts adhesion on the face the player is standing on. */
+    private boolean attach(final Player player, final AdhesionState state) {
+        if (player.isSpectator() || player.isPassenger()) return false;
+
+        final SubLevel subLevel = Sable.HELPER.getTrackingSubLevel(player);
+        if (subLevel == null || subLevel.isRemoved() || subLevel.getLevel() != player.level()) return false;
+
+        final Pose3dc pose = subLevel.logicalPose();
+        final Quaterniond upright = new Quaterniond(pose.orientation()).invert();
+        final Hitbox hitbox = new Hitbox(player).orient(upright);
+        final Vector3d centre = hitbox.localCentre(player.position(), IDENTITY, pose, new Vector3d());
+        final Vector3d down = pose.transformNormalInverse(new Vector3d(0.0, -1.0, 0.0), new Vector3d()).normalize();
+
+        final SurfaceProbe.Face face = SurfaceProbe.cast(player, subLevel, centre, down,
+                hitbox.extent(down) + ATTACH_REACH);
+        if (face == null) return false;
+
+        final Vector3d up = pose.transformNormal(face.normal(), new Vector3d()).normalize();
+        if (up.y < MIN_UPWARD) return false;
+
+        final Transition.Contact contact = new Transition.Contact(face.normal(), face.plane());
+        state.attach(subLevel, face.normal(), face.plane(), upright);
+        state.begin(new Transition(upright,
+                new Quaterniond(upright).mul(Rotations.swing(Rotations.UP, up, new Quaterniond())),
+                ALIGN_TICKS, new Transition.Contact[]{contact}, contact));
         return true;
     }
 
-    /**
-     * Starts a plane change when the hitbox touches a face perpendicular to the current one.
-     *
-     * <p>There is no limit on the accumulated angle, so floor to wall to ceiling to wall and back
-     * to the floor all work, in either direction. Touching a perpendicular face with the head is
-     * the same event as touching one with the side, so that flips the player too.
-     */
-    public static boolean tryPlaneChange(final Player player, final AdhesionState state, final SubLevel subLevel,
-                                         final @Nullable SubLevelEntityCollision.CollisionInfo collision) {
-        if (collision == null || collision.firstCollisions == null) return false;
-        final SubLevelEntityCollision.FirstCollisionInfo first = collision.firstCollisions.get(subLevel);
-        if (first == null) return false;
+    /** Refreshes the support plane and reports whether the box is resting on it. */
+    private boolean updateSupport(final Player player, final AdhesionState state, final SubLevel subLevel,
+                                  final Hitbox hitbox, final Vector3dc centre) {
+        final Vector3dc normal = state.support();
+        final double extent = hitbox.extent(normal);
+        final SurfaceProbe.Face face = SurfaceProbe.cast(player, subLevel, centre,
+                new Vector3d(normal).negate(), extent + SUPPORT_REACH);
 
-        final Pose3dc pose = subLevel.logicalPose();
-        final Vector3d targetUp = pose.transformNormalInverse(new Vector3d(first.globalDirection()), new Vector3d());
-        if (targetUp.lengthSquared() < 1.0e-9) return false;
-        AdhesionMath.snapAxis(targetUp.normalize(), targetUp);
-
-        final Vector3dc currentUp = state.currentLocalUp();
-        if (Math.abs(currentUp.dot(targetUp)) > AdhesionSettings.PERPENDICULAR_TOLERANCE) return false;
-
-        final double eyeHeight = player.getEyeHeight();
-        final double halfWidth = player.getBbWidth() * 0.5;
-        final Vector3d pivotLocal = SurfaceProbe.localPivot(player, pose, new Vector3d());
-
-        final SurfaceProbe.Hit fromHit = SurfaceProbe.probe(player, subLevel, pivotLocal, currentUp,
-                eyeHeight + AdhesionSettings.NEAR_SUPPORT_GAP);
-        final SurfaceProbe.Hit toHit = SurfaceProbe.probe(player, subLevel, pivotLocal, targetUp,
-                halfWidth + AdhesionSettings.CONTACT_REACH);
-        if (fromHit == null || toHit == null) return false;
-
-        if (!cornerIsClear(player, subLevel, pivotLocal, currentUp, targetUp,
-                fromHit.planeCoordinate(), toHit.planeCoordinate(), eyeHeight, halfWidth)) {
+        if (face == null || face.normal().dot(normal) < 0.9) {
+            if (!state.isChanging()) release(state, subLevel);
             return false;
         }
-
-        return state.beginPlaneChange(targetUp, fromHit.planeCoordinate(), toHit.planeCoordinate(),
-                eyeHeight, halfWidth);
-    }
-
-    /** Walks the whole arc up front and refuses it unless every step and the destination are free. */
-    public static boolean cornerIsClear(final Player player, final SubLevel subLevel, final Vector3dc pivotLocal,
-                                        final Vector3dc fromUp, final Vector3dc toUp, final double fromPlane,
-                                        final double toPlane, final double eyeHeight, final double halfWidth) {
-        final PlaneTransition arc = PlaneTransition.corner(fromUp, toUp, fromPlane, toPlane, eyeHeight, halfWidth,
-                AdhesionSettings.CORNER_TICKS);
-        if (arc == null) return false;
-
-        final Vector3d previous = new Vector3d();
-        final Vector3d sample = new Vector3d();
-        for (int i = 0; i <= AdhesionSettings.ARC_SAMPLES; i++) {
-            arc.pivotAt(i / (double) AdhesionSettings.ARC_SAMPLES, pivotLocal, sample);
-            if (i > 0 && !SurfaceProbe.isClear(player, subLevel, previous, sample)) return false;
-            previous.set(sample);
-        }
-
-        final double headRoom = player.getBbHeight() - eyeHeight + 0.05;
-        if (!SurfaceProbe.isClear(player, subLevel, sample, toUp, headRoom)) return false;
-
-        final Vector3d side = new Vector3d(fromUp).cross(toUp).normalize();
-        final double reach = halfWidth + 0.02;
-        return SurfaceProbe.isClear(player, subLevel, sample, side, reach)
-                && SurfaceProbe.isClear(player, subLevel, sample, side, -reach);
+        state.setSupportPlane(face.plane());
+        return hitbox.gap(centre, normal, face.plane()) <= CONTACT_GAP;
     }
 
     /**
-     * Places the pivot on the corner arc.
-     *
-     * <p>The position is absolute, recomputed from the planes every tick rather than integrated,
-     * so it cannot drift and any error is corrected on the next tick. Sable rotates the hitbox
-     * around the vanilla eye position, so that is the point being placed here; treating the feet
-     * as the pivot is what left them behind the wall.
+     * Rolls onto the plane the player is pushing into. Symmetric by construction: the current
+     * support is the only excluded axis, so a wall leads back to the floor exactly like the floor
+     * leads to the wall.
      */
-    public static void applyCornerPosition(final Player player, final AdhesionState state, final SubLevel subLevel) {
-        final Pose3dc pose = subLevel.logicalPose();
-        final Vector3d pivotLocal = SurfaceProbe.localPivot(player, pose, new Vector3d());
-        final Vector3d targetLocal = state.transitionPivotTarget(pivotLocal, new Vector3d());
-        if (targetLocal == null) return;
-        final Vector3d targetWorld = pose.transformPosition(targetLocal, new Vector3d());
-        player.setPos(targetWorld.x, targetWorld.y - player.getEyeHeight(), targetWorld.z);
-    }
+    private void tryRoll(final Player player, final AdhesionState state, final SubLevel subLevel,
+                         final Pose3dc pose, final Hitbox hitbox, final Vector3dc centre) {
+        final SubLevelEntityCollision.CollisionInfo info = ((EntityMovementExtension) player).sable$getCollisionInfo();
+        if (info == null || info.preDeltaMovement == null) return;
 
-    /** Replaces the world-down pull with a pull into the current surface. */
-    public static void applyLocalGravity(final Player player, final AdhesionState state) {
-        if (player.isNoGravity()) return;
-        final Quaterniondc orientation = state.orientationAt(1.0f);
-        if (orientation == null) return;
+        final Vector3d press = pose.transformNormalInverse(new Vector3d(info.preDeltaMovement.x,
+                info.preDeltaMovement.y, info.preDeltaMovement.z), new Vector3d());
+        final Vector3dc support = state.support();
 
-        final Vector3d up = orientation.transform(new Vector3d(AdhesionMath.UP), new Vector3d());
-        if (up.lengthSquared() < 1.0e-9) return;
-        up.normalize();
+        Vector3dc target = null;
+        double targetPlane = 0.0;
+        double best = MIN_PRESS;
+        for (final Vector3dc axis : Rotations.AXES) {
+            if (Math.abs(axis.dot(support)) > 0.5 || -press.dot(axis) <= best) continue;
 
-        final double gravity = player.getAttributeValue(Attributes.GRAVITY);
-        final Vec3 motion = player.getDeltaMovement();
-        player.setDeltaMovement(
-                motion.x - up.x * AdhesionSettings.ADHESION_PULL,
-                motion.y + gravity - up.y * AdhesionSettings.ADHESION_PULL,
-                motion.z - up.z * AdhesionSettings.ADHESION_PULL);
-    }
+            final SurfaceProbe.Face face = SurfaceProbe.cast(player, subLevel, centre,
+                    new Vector3d(axis).negate(), hitbox.extent(axis) + CONTACT_GAP);
+            if (face == null || face.normal().dot(axis) < 0.9) continue;
 
-    /** Keeps adhesion alive while there is a surface under the pivot, including mid-jump. */
-    public static void updateSupport(final Player player, final AdhesionState state, final SubLevel subLevel,
-                                     final @Nullable SubLevelEntityCollision.CollisionInfo collision) {
-        final double support = SurfaceProbe.distanceToSurface(player, subLevel, state.currentLocalUp(),
-                AdhesionSettings.JUMP_SUPPORT_GAP);
-        state.setSupportDistance(support);
-
-        final boolean standing = (collision != null && collision.trackingSubLevel == subLevel
-                && collision.verticalCollisionBelow)
-                || (!Double.isNaN(support)
-                    && support <= player.getEyeHeight() + AdhesionSettings.NEAR_SUPPORT_GAP);
-
-        if (standing) {
-            state.resetSupportMisses();
-            player.resetFallDistance();
-        } else if (!Double.isNaN(support)) {
-            state.resetSupportMisses();
-        } else if (state.missSupport() > AdhesionSettings.SUPPORT_GRACE_TICKS) {
-            state.detach();
+            target = axis;
+            targetPlane = face.plane();
+            best = -press.dot(axis);
         }
+        if (target == null) return;
+
+        final Transition roll = Transition.roll(state.localOrientation(), support, state.supportPlane(),
+                target, targetPlane, ROLL_TICKS);
+        if (arcIsClear(player, subLevel, hitbox, roll, centre)) state.begin(roll);
     }
 
-    public static void clearInheritedVelocity(final Player player) {
-        if (player instanceof final LivingEntityMovementExtension extension) {
-            extension.sable$getInheritedVelocity().zero();
+    /** Ramps back to the sub-level's own orientation, then adhesion ends. */
+    private void release(final AdhesionState state, final SubLevel subLevel) {
+        state.begin(new Transition(state.localOrientation(),
+                new Quaterniond(subLevel.logicalPose().orientation()).invert(), RELEASE_TICKS,
+                Transition.NONE, null));
+    }
+
+    /** The box has to fit through the whole rotation, not only at its ends. */
+    private boolean arcIsClear(final Player player, final SubLevel subLevel, final Hitbox hitbox,
+                               final Transition roll, final Vector3dc centre) {
+        final Quaterniond sample = new Quaterniond();
+        final Vector3d swept = new Vector3d();
+        final Vector3d[] corners = new Vector3d[8];
+        for (int corner = 0; corner < corners.length; corner++) corners[corner] = new Vector3d();
+
+        for (final double progress : ARC_SAMPLES) {
+            hitbox.orient(roll.orientationAt(progress, sample));
+            swept.set(centre);
+            for (final Transition.Contact contact : roll.contacts()) {
+                hitbox.rest(swept, contact.normal(), contact.plane());
+            }
+            hitbox.corners(swept, ARC_SKIN, corners);
+            if (!SurfaceProbe.clear(player, subLevel, corners)) return false;
         }
+        return true;
     }
 
-    public static boolean ownsMovement(final Player player) {
-        return !player.level().isClientSide() || player.isLocalPlayer();
+    /** Pure sub-level motion of the contact anchor between the last pose and the current one. */
+    private @Nullable Vec3 frameCarry(final SubLevel subLevel, final Vec3 anchor) {
+        final Vector3d local = subLevel.lastPose().transformPositionInverse(
+                new Vector3d(anchor.x, anchor.y, anchor.z), new Vector3d());
+        subLevel.logicalPose().transformPosition(local, local);
+        final Vec3 carry = new Vec3(local.x - anchor.x, local.y - anchor.y, local.z - anchor.z);
+        return carry.lengthSqr() < 1.0e-8 ? null : carry;
     }
 
-    public static boolean eligible(final Player player) {
-        return !player.isSpectator()
-                && !player.isPassenger()
-                && !player.getAbilities().flying
-                && !player.isFallFlying()
-                && !player.isSleeping()
-                && !player.isInWater()
-                && !player.isInLava();
-    }
+    /**
+     * Undoes the vanilla vertical pull and applies the same magnitude along the local down axis, so
+     * a tilted or vertical plane holds the player instead of sliding them off it.
+     */
+    private void redirectGravity(final Player player, final AdhesionState state) {
+        if (player.getAbilities().flying || player.isFallFlying() || player.isInWater() || player.isInLava()
+                || player.hasEffect(MobEffects.LEVITATION)) {
+            return;
+        }
 
-    public static AdhesionState createState(final Player player) {
-        return ((AdhesionAccess) player).centrifugalForce$getOrCreateAdhesionState();
-    }
+        final Vector3d up = state.currentOrientation().transform(new Vector3d(Rotations.UP));
+        final double pull = player.getAttributeValue(Attributes.GRAVITY) * VERTICAL_DRAG;
+        if (pull == 0.0 || up.y > 1.0 - 1.0e-9) return;
 
-    public static @Nullable AdhesionState peekState(final Player player) {
-        return ((AdhesionAccess) player).centrifugalForce$peekAdhesionState();
+        player.setDeltaMovement(player.getDeltaMovement()
+                .add(0.0, pull, 0.0)
+                .subtract(up.x * pull, up.y * pull, up.z * pull));
     }
 }

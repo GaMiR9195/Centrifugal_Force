@@ -9,7 +9,7 @@ displayName="${mod_name}"
 logoFile="icon.png"
 logoBlur=false
 authors="playsi"
-description="Sable wall-walking with an oriented hitbox, relative camera alignment, safe corner transitions, jumping, and a compact debug overlay."
+description="Wall walking on Sable sub-levels: an oriented hitbox that keeps its feet on the surface, rolls between perpendicular planes in both directions and falls along its own local down axis."
 
 [[mixins]]
 config="centrifugal_force.mixins.json"
