@@ -1,0 +1,18 @@
+{
+  "surefooting.configuration.enabled": "Enabled",
+  "surefooting.configuration.rotate_jump_velocity": "Rotate Jump Velocity",
+  "surefooting.configuration.rotate_ground_velocity": "Rotate Ground Velocity",
+  "surefooting.configuration.jump_rotation_strength": "Jump Rotation Strength",
+  "surefooting.configuration.ground_rotation_strength": "Ground Rotation Strength",
+  "surefooting.configuration.carry_timeout_ticks": "Carry Timeout (Ticks)",
+  "surefooting.configuration.exit_distance_blocks": "Exit Distance (Blocks)",
+  "surefooting.configuration.debug_logging": "Debug Logging",
+  "surefooting.configuration.anchor_particles": "Anchor Particles",
+  "surefooting.configuration.particle_exit_distance_blocks": "Particle Exit Distance (Blocks)",
+  "surefooting.configuration.carry_entities": "Carry Entities",
+  "surefooting.configuration.entity_jump_rotation_strength": "Entity Jump Rotation Strength",
+  "surefooting.configuration.entity_ground_rotation_strength": "Entity Ground Rotation Strength",
+  "surefooting.configuration.rotate_entity_yaw": "Rotate Entity Yaw",
+  "surefooting.configuration.exit_distance_overrides": "Exit Distance Overrides (per type)",
+  "surefooting.configuration.carry_blacklist": "Carry Blacklist"
+}

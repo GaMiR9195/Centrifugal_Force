@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "com.playsi.centrifugal_force.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "EntityAdhesionStateMixin",
+    "EntitySubLevelUtilMixin"
+  ],
+  "client": [],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

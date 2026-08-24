@@ -1,0 +1,1 @@
+- Fix NeoForge crash when ImGuiMC is not loaded
